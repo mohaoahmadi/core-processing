@@ -1,3 +1,10 @@
+"""Land cover classification processor module.
+
+This module implements land cover classification for geospatial imagery.
+It provides functionality to classify pixels into different land cover
+types based on spectral characteristics.
+"""
+
 import numpy as np
 import rasterio
 from typing import List, Dict, Any
@@ -13,7 +20,19 @@ from config import get_settings
 settings = get_settings()
 
 class LandCoverProcessor(BaseProcessor):
-    """Processor for land cover classification"""
+    """Processor for land cover classification.
+    
+    This processor analyzes multispectral imagery to classify pixels into
+    different land cover categories using spectral thresholding.
+    
+    Attributes:
+        CLASSES (Dict[int, str]): Mapping of class IDs to land cover types:
+            0: Unknown
+            1: Water
+            2: Vegetation
+            3: Built-up
+            4: Bare Soil
+    """
     
     CLASSES = {
         0: "Unknown",
@@ -24,10 +43,40 @@ class LandCoverProcessor(BaseProcessor):
     }
 
     async def validate_input(self, **kwargs) -> bool:
+        """Validate input parameters for land cover classification.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_path (str): Path to input image (local or S3)
+                output_name (str): Base name for output files
+                
+        Returns:
+            bool: True if all required parameters are present and valid
+        """
         required = {"input_path", "output_name"}
         return all(key in kwargs for key in required)
 
     async def process(self, **kwargs) -> ProcessingResult:
+        """Execute land cover classification.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_path (str): Path to input image (local or S3)
+                output_name (str): Base name for output files
+                
+        Returns:
+            ProcessingResult: Processing result containing:
+                - Path to classified image in S3
+                - Color map for visualization
+                - Pixel count statistics for each class
+                
+        Note:
+            The classification uses simple spectral thresholding rules:
+            - Water: Low reflectance in all bands
+            - Vegetation: High reflectance in NIR and red bands
+            - Built-up: High reflectance in red, low in NIR
+            - Bare Soil: Moderate reflectance across all bands
+        """
         input_path: str = kwargs["input_path"]
         output_name: str = kwargs["output_name"]
         
@@ -104,7 +153,11 @@ class LandCoverProcessor(BaseProcessor):
                 os.unlink(input_path)
 
     async def cleanup(self) -> None:
-        """Clean up temporary files"""
+        """Clean up temporary files.
+        
+        Removes all temporary files created during processing from the
+        landcover output directory.
+        """
         output_dir = Path(settings.TEMP_DIR) / "landcover"
         if output_dir.exists():
             for file in output_dir.glob("*.tif"):

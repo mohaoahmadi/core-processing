@@ -1,3 +1,10 @@
+"""Geospatial processing utility module.
+
+This module provides utility functions for processing geospatial raster data,
+including array normalization, color mapping, raster alignment, and various
+index calculations (NDVI, NDWI, slope).
+"""
+
 import numpy as np
 from typing import List, Tuple, Dict, Any
 import rasterio
@@ -10,7 +17,19 @@ from shapely.geometry import box, Polygon
 from shapely.ops import transform
 
 def normalize_array(array: np.ndarray) -> np.ndarray:
-    """Normalize array values to 0-1 range"""
+    """Normalize array values to the range [0, 1].
+    
+    Args:
+        array (np.ndarray): Input array to normalize
+        
+    Returns:
+        np.ndarray: Normalized array
+        
+    Note:
+        Uses min-max normalization: (x - min) / (max - min)
+        A small epsilon (1e-10) is added to the denominator to avoid
+        division by zero in case of constant arrays.
+    """
     min_val = np.min(array)
     max_val = np.max(array)
     return (array - min_val) / (max_val - min_val + 1e-10)
@@ -19,7 +38,24 @@ def create_color_map(
     array: np.ndarray,
     class_map: Dict[int, str]
 ) -> Dict[str, List[int]]:
-    """Create a color map for classified raster"""
+    """Create a color mapping for classified raster visualization.
+    
+    Args:
+        array (np.ndarray): Classified raster array
+        class_map (Dict[int, str]): Mapping of class IDs to names
+        
+    Returns:
+        Dict[str, List[int]]: Mapping of class names to RGB colors
+        
+    Note:
+        Predefined colors are used for common classes:
+        - Unknown: [0, 0, 0] (black)
+        - Water: [0, 0, 255] (blue)
+        - Vegetation: [0, 255, 0] (green)
+        - Built-up: [255, 0, 0] (red)
+        - Bare Soil: [139, 69, 19] (brown)
+        Other classes default to [128, 128, 128] (gray)
+    """
     colors = {
         "Unknown": [0, 0, 0],
         "Water": [0, 0, 255],
@@ -33,7 +69,27 @@ def align_rasters(
     rasters: List[np.ndarray],
     profiles: List[Dict[str, Any]]
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Align multiple rasters to the same coordinate system and resolution"""
+    """Align multiple rasters to a common coordinate system and resolution.
+    
+    Args:
+        rasters (List[np.ndarray]): List of raster arrays to align
+        profiles (List[Dict[str, Any]]): List of raster profiles with metadata
+        
+    Returns:
+        Tuple[np.ndarray, Dict[str, Any]]: Tuple containing:
+            - Stack of aligned raster arrays
+            - Updated profile for the aligned rasters
+            
+    Raises:
+        ValueError: If rasters or profiles lists are empty
+        
+    Note:
+        The alignment process:
+        1. Uses the first raster's CRS as reference
+        2. Finds the common extent of all rasters
+        3. Calculates optimal resolution
+        4. Reprojects all rasters to match
+    """
     if not rasters or not profiles:
         raise ValueError("Empty rasters or profiles list")
     
@@ -93,7 +149,24 @@ def align_rasters(
     return np.stack(aligned), ref_profile
 
 def blend_overlapping_areas(rasters: np.ndarray) -> np.ndarray:
-    """Blend overlapping areas using a feathering technique"""
+    """Blend overlapping areas in multiple rasters using distance-based weights.
+    
+    Args:
+        rasters (np.ndarray): 3D array of rasters (n_rasters, height, width)
+        
+    Returns:
+        np.ndarray: Blended raster array
+        
+    Raises:
+        ValueError: If input is not a 3D array
+        
+    Note:
+        The blending process:
+        1. Calculates distance from edges for each raster
+        2. Uses these distances as weights for blending
+        3. Normalizes weights to sum to 1
+        4. Applies weighted average blending
+    """
     if len(rasters.shape) != 3:
         raise ValueError("Expected 3D array (n_rasters, height, width)")
     
@@ -130,14 +203,41 @@ def calculate_ndwi(
     green_band: np.ndarray,
     nir_band: np.ndarray
 ) -> np.ndarray:
-    """Calculate Normalized Difference Water Index"""
+    """Calculate Normalized Difference Water Index (NDWI).
+    
+    Args:
+        green_band (np.ndarray): Green band array
+        nir_band (np.ndarray): Near-infrared band array
+        
+    Returns:
+        np.ndarray: NDWI array with values in [-1, 1]
+        
+    Note:
+        NDWI = (Green - NIR) / (Green + NIR)
+        Used for water body mapping and moisture content assessment.
+        Positive values typically indicate water bodies.
+    """
     return (green_band - nir_band) / (green_band + nir_band + 1e-10)
 
 def calculate_slope(
     dem: np.ndarray,
     resolution: float
 ) -> np.ndarray:
-    """Calculate slope from DEM"""
+    """Calculate slope from a Digital Elevation Model (DEM).
+    
+    Args:
+        dem (np.ndarray): Digital Elevation Model array
+        resolution (float): Spatial resolution of the DEM
+        
+    Returns:
+        np.ndarray: Slope array in degrees
+        
+    Note:
+        Uses the gradient method to calculate slope:
+        1. Calculates elevation gradients in x and y directions
+        2. Converts gradients to slope in degrees
+        3. Returns values in range [0, 90]
+    """
     dy, dx = np.gradient(dem, resolution)
     slope = np.degrees(np.arctan(np.sqrt(dx*dx + dy*dy)))
     return slope 

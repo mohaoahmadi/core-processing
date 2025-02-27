@@ -1,3 +1,11 @@
+"""Orthomosaic generation processor module.
+
+This module implements functionality for generating orthomosaic images
+from multiple overlapping aerial or satellite images. It provides various
+blending methods to create seamless mosaics while handling different
+projections and resolutions.
+"""
+
 import numpy as np
 import rasterio
 from pathlib import Path
@@ -13,9 +21,34 @@ from config import get_settings
 settings = get_settings()
 
 class OrthomosaicProcessor(BaseProcessor):
-    """Processor for generating orthomosaic from multiple images"""
+    """Processor for generating orthomosaic from multiple images.
+    
+    This processor combines multiple overlapping images into a single
+    seamless mosaic. It supports different blending methods and handles
+    alignment of images with different projections and resolutions.
+    
+    The processor provides four blending methods:
+    - average: Simple averaging of overlapping pixels
+    - maximum: Takes the maximum value in overlapping areas
+    - minimum: Takes the minimum value in overlapping areas
+    - feather: Gradual blending based on distance from edges
+    """
 
     async def validate_input(self, **kwargs) -> bool:
+        """Validate input parameters for orthomosaic generation.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_paths (List[str]): Paths to input images (local or S3)
+                output_name (str): Base name for output files
+                method (str): Blending method to use
+                
+        Returns:
+            bool: True if all required parameters are present and valid
+            
+        Note:
+            The method must be one of: "average", "maximum", "minimum", "feather"
+        """
         required = {
             "input_paths",
             "output_name",
@@ -28,6 +61,27 @@ class OrthomosaicProcessor(BaseProcessor):
         return kwargs["method"] in valid_methods
 
     async def process(self, **kwargs) -> ProcessingResult:
+        """Execute orthomosaic generation.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_paths (List[str]): Paths to input images (local or S3)
+                output_name (str): Base name for output files
+                method (str): Blending method to use
+                
+        Returns:
+            ProcessingResult: Processing result containing:
+                - Path to orthomosaic image in S3
+                - Statistics (min, max, mean, std)
+                - Processing metadata (method, input count, etc.)
+                
+        Note:
+            The process involves several steps:
+            1. Download input files if they're in S3
+            2. Align all rasters to the same coordinate system
+            3. Apply the selected blending method
+            4. Upload the result back to S3
+        """
         input_paths: List[str] = kwargs["input_paths"]
         output_name: str = kwargs["output_name"]
         method: str = kwargs["method"]
@@ -112,7 +166,11 @@ class OrthomosaicProcessor(BaseProcessor):
                     os.unlink(temp_path)
 
     async def cleanup(self) -> None:
-        """Clean up temporary files"""
+        """Clean up temporary files.
+        
+        Removes all temporary files created during processing from the
+        orthomosaic output directory.
+        """
         output_dir = Path(settings.TEMP_DIR) / "orthomosaic"
         if output_dir.exists():
             for file in output_dir.glob("*.tif"):

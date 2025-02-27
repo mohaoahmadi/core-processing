@@ -1,3 +1,11 @@
+"""NDVI calculation processor module.
+
+This module implements the Normalized Difference Vegetation Index (NDVI)
+calculation for satellite or aerial imagery. NDVI is a standardized index
+that allows generation of an image showing relative biomass or vegetation
+health.
+"""
+
 import numpy as np
 import rasterio
 from pathlib import Path
@@ -13,9 +21,30 @@ from config import get_settings
 settings = get_settings()
 
 class NDVIProcessor(BaseProcessor):
-    """Processor for calculating Normalized Difference Vegetation Index"""
+    """Processor for calculating Normalized Difference Vegetation Index.
+    
+    This processor calculates NDVI using the formula:
+    NDVI = (NIR - Red) / (NIR + Red)
+    
+    The result is scaled to 0-255 for visualization, where:
+    - Higher values (brighter) indicate healthy vegetation
+    - Lower values (darker) indicate non-vegetated areas
+    - Values around 0 typically represent water or bare soil
+    """
 
     async def validate_input(self, **kwargs) -> bool:
+        """Validate input parameters for NDVI calculation.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_path (str): Path to input image (local or S3)
+                output_name (str): Base name for output files
+                red_band (int): Band number for red channel
+                nir_band (int): Band number for near-infrared channel
+                
+        Returns:
+            bool: True if all required parameters are present and valid
+        """
         required = {
             "input_path",
             "output_name",
@@ -25,6 +54,26 @@ class NDVIProcessor(BaseProcessor):
         return all(key in kwargs for key in required)
 
     async def process(self, **kwargs) -> ProcessingResult:
+        """Execute NDVI calculation.
+        
+        Args:
+            **kwargs: Keyword arguments containing:
+                input_path (str): Path to input image (local or S3)
+                output_name (str): Base name for output files
+                red_band (int): Band number for red channel
+                nir_band (int): Band number for near-infrared channel
+                
+        Returns:
+            ProcessingResult: Processing result containing:
+                - Path to NDVI image in S3
+                - Statistics (min, max, mean, std)
+                - Band information used for calculation
+                
+        Note:
+            The output is scaled to 8-bit (0-255) for visualization:
+            - NDVI values of -1 to 1 are mapped to 0-255
+            - The formula used is: output = (NDVI + 1) * 127.5
+        """
         input_path: str = kwargs["input_path"]
         output_name: str = kwargs["output_name"]
         red_band: int = kwargs["red_band"]
@@ -107,7 +156,11 @@ class NDVIProcessor(BaseProcessor):
                 os.unlink(input_path)
 
     async def cleanup(self) -> None:
-        """Clean up temporary files"""
+        """Clean up temporary files.
+        
+        Removes all temporary files created during processing from the
+        NDVI output directory.
+        """
         output_dir = Path(settings.TEMP_DIR) / "ndvi"
         if output_dir.exists():
             for file in output_dir.glob("*.tif"):

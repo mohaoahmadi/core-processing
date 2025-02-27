@@ -1,3 +1,10 @@
+"""GeoServer REST API client module.
+
+This module provides asynchronous operations for interacting with GeoServer,
+including workspace management and layer publishing capabilities.
+All operations are performed in a non-blocking manner using asyncio.
+"""
+
 from typing import Optional, Dict, Any
 import requests
 from requests.auth import HTTPBasicAuth
@@ -8,7 +15,15 @@ settings = get_settings()
 _geoserver_session: Optional[requests.Session] = None
 
 def init_geoserver_client() -> None:
-    """Initialize GeoServer client session"""
+    """Initialize the GeoServer client session.
+    
+    Creates a new requests Session with basic authentication using credentials
+    from settings. The session is stored in a module-level variable for reuse.
+    
+    Note:
+        This function should be called during application startup.
+        It uses GeoServer credentials from settings (username, password).
+    """
     global _geoserver_session
     _geoserver_session = requests.Session()
     _geoserver_session.auth = HTTPBasicAuth(
@@ -17,13 +32,33 @@ def init_geoserver_client() -> None:
     )
 
 def get_geoserver_session() -> requests.Session:
-    """Get GeoServer session"""
+    """Get the GeoServer session instance.
+    
+    Returns:
+        requests.Session: The initialized GeoServer session with authentication
+        
+    Note:
+        If the session hasn't been initialized, this function will
+        automatically initialize it before returning.
+    """
     if _geoserver_session is None:
         init_geoserver_client()
     return _geoserver_session
 
 async def create_workspace(workspace: str = None) -> Dict[str, Any]:
-    """Create a new workspace in GeoServer"""
+    """Create a new workspace in GeoServer asynchronously.
+    
+    Args:
+        workspace (str, optional): Name of the workspace to create.
+            If None, uses the default workspace from settings.
+            
+    Returns:
+        Dict[str, Any]: Response containing workspace creation status
+        
+    Note:
+        The workspace creation is performed in a separate thread to avoid
+        blocking the event loop. Raises HTTPError for failed requests.
+    """
     session = get_geoserver_session()
     workspace = workspace or settings.GEOSERVER_WORKSPACE
     
@@ -44,7 +79,20 @@ async def publish_geotiff(
     file_path: str,
     workspace: str = None
 ) -> Dict[str, Any]:
-    """Publish a GeoTIFF file as a new layer"""
+    """Publish a GeoTIFF file as a new layer in GeoServer asynchronously.
+    
+    Args:
+        layer_name (str): Name for the new layer
+        file_path (str): Path to the GeoTIFF file to publish
+        workspace (str, optional): Target workspace. If None, uses default workspace.
+        
+    Returns:
+        Dict[str, Any]: Response containing layer publication status
+        
+    Note:
+        The file upload and layer creation are performed in a separate thread
+        to avoid blocking the event loop. Raises HTTPError for failed requests.
+    """
     session = get_geoserver_session()
     workspace = workspace or settings.GEOSERVER_WORKSPACE
     
@@ -70,7 +118,22 @@ async def delete_layer(
     workspace: str = None,
     recurse: bool = True
 ) -> Dict[str, Any]:
-    """Delete a layer from GeoServer"""
+    """Delete a layer from GeoServer asynchronously.
+    
+    Args:
+        layer_name (str): Name of the layer to delete
+        workspace (str, optional): Workspace containing the layer.
+            If None, uses default workspace.
+        recurse (bool, optional): Whether to recursively delete all resources.
+            Defaults to True.
+            
+    Returns:
+        Dict[str, Any]: Response containing layer deletion status
+        
+    Note:
+        The layer deletion is performed in a separate thread to avoid
+        blocking the event loop. Raises HTTPError for failed requests.
+    """
     session = get_geoserver_session()
     workspace = workspace or settings.GEOSERVER_WORKSPACE
     
