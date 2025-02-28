@@ -2,7 +2,7 @@
 
 This module implements the main FastAPI application for the Core Processing API.
 It provides RESTful endpoints for:
-- Geospatial image processing (NDVI, land cover, orthomosaic)
+- Geospatial image processing (NDVI, land cover, orthomosaic, health indices)
 - Job management and status tracking
 - GeoServer integration for processed results
 
@@ -37,6 +37,7 @@ from lib.job_manager import JobManager
 from processors.landcover import LandCoverProcessor
 from processors.ndvi import NDVIProcessor
 from processors.orthomosaic import OrthomosaicProcessor
+from processors.health_indices import HealthIndicesProcessor, HEALTH_INDICES
 from utils.logging import setup_logging
 
 settings = get_settings()
@@ -53,6 +54,7 @@ class ProcessingJobRequest(BaseModel):
             - "landcover": Land cover classification
             - "ndvi": Normalized Difference Vegetation Index
             - "orthomosaic": Orthomosaic generation
+            - "health_indices": Multiple vegetation and health indices
         input_file (str): Path or identifier of the input file
         org_id (str): Organization identifier
         project_id (str): Project identifier
@@ -60,6 +62,7 @@ class ProcessingJobRequest(BaseModel):
             - For landcover: classification thresholds
             - For NDVI: band indices
             - For orthomosaic: blending method
+            - For health_indices: indices list, sensor type, band mapping
     """
     process_type: str
     input_file: str
@@ -162,7 +165,8 @@ async def create_job(
         processor_map = {
             "landcover": LandCoverProcessor(),
             "ndvi": NDVIProcessor(),
-            "orthomosaic": OrthomosaicProcessor()
+            "orthomosaic": OrthomosaicProcessor(),
+            "health_indices": HealthIndicesProcessor()
         }
         
         if job_request.process_type not in processor_map:
@@ -298,6 +302,38 @@ async def publish_to_geoserver(
     except Exception as e:
         logger.error(f"Error publishing to GeoServer: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/health-indices", response_model=Dict[str, Dict[str, Any]])
+async def list_health_indices():
+    """List all available health indices with descriptions and metadata.
+    
+    Returns:
+        Dict[str, Dict[str, Any]]: Dictionary of health indices with their metadata
+    """
+    logger.info("Listing available health indices")
+    
+    try:
+        # Return the health indices dictionary with metadata
+        return HEALTH_INDICES
+    except Exception as e:
+        logger.error(f"Error listing health indices: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error listing health indices: {str(e)}")
+
+@app.get(f"{settings.API_V1_PREFIX}/sensors", response_model=Dict[str, Dict[str, int]])
+async def list_sensor_band_mappings():
+    """List all supported sensors and their default band mappings.
+    
+    Returns:
+        Dict[str, Dict[str, int]]: Dictionary of sensors with their band mappings
+    """
+    logger.info("Listing supported sensors and band mappings")
+    
+    try:
+        from processors.health_indices import DEFAULT_BAND_MAPPINGS
+        return DEFAULT_BAND_MAPPINGS
+    except Exception as e:
+        logger.error(f"Error listing sensor band mappings: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error listing sensor band mappings: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
