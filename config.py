@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # AWS S3 Configuration
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
-    AWS_DEFAULT_REGION: str = "us-east-1"
+    AWS_DEFAULT_REGION: str = "eu-west-1"
     S3_BUCKET_NAME: str
 
     # GeoServer Configuration

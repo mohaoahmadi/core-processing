@@ -8,6 +8,7 @@ a consistent interface across different processing implementations.
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
+from loguru import logger
 
 class ProcessingResult(BaseModel):
     """Model for standardized processing results.
@@ -43,6 +44,7 @@ class BaseProcessor(ABC):
         Sets up the initial state with no result.
         """
         self.result = None
+        logger.debug(f"Initialized {self.__class__.__name__} processor")
 
     @abstractmethod
     async def validate_input(self, **kwargs) -> bool:
@@ -87,6 +89,7 @@ class BaseProcessor(ABC):
             This method can be overridden by subclasses if cleanup is needed.
             The default implementation does nothing.
         """
+        logger.debug(f"Running cleanup for {self.__class__.__name__} processor")
         pass
 
     async def __call__(self, **kwargs) -> ProcessingResult:
@@ -108,19 +111,35 @@ class BaseProcessor(ABC):
             Subclasses should not override this method; instead, they should
             implement validate_input, process, and optionally cleanup.
         """
+        processor_name = self.__class__.__name__
+        logger.info(f"Starting {processor_name} processing")
+        logger.debug(f"Processing parameters: {kwargs}")
+        
         try:
+            # Validate input
+            logger.info(f"Validating input parameters for {processor_name}")
             if not await self.validate_input(**kwargs):
+                logger.error(f"{processor_name} input validation failed")
                 return ProcessingResult(
                     status="error",
                     message="Invalid input parameters"
                 )
+            logger.info(f"{processor_name} input validation successful")
             
+            # Execute processing
+            logger.info(f"Executing {processor_name} processing")
             self.result = await self.process(**kwargs)
+            logger.info(f"{processor_name} processing completed with status: {self.result.status}")
+            logger.debug(f"{processor_name} result: {self.result}")
             return self.result
+            
         except Exception as e:
+            logger.error(f"Error in {processor_name} processing: {str(e)}", exc_info=True)
             return ProcessingResult(
                 status="error",
                 message=str(e)
             )
         finally:
-            await self.cleanup() 
+            logger.info(f"Running {processor_name} cleanup")
+            await self.cleanup()
+            logger.info(f"{processor_name} processing finished") 

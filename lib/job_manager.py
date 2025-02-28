@@ -11,6 +11,15 @@ from enum import Enum
 from datetime import datetime
 import asyncio
 from loguru import logger
+from dataclasses import dataclass, field
+
+@dataclass
+class ProcessingResult:
+    """Model for processing result data."""
+    status: str
+    message: str
+    output_path: Optional[str]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class JobStatus(Enum):
     """Enumeration of possible job states.
@@ -37,7 +46,7 @@ class Job:
         processor (Callable): Function that performs the actual processing
         params (Dict[str, Any]): Parameters to pass to the processor
         status (JobStatus): Current status of the job
-        result (Optional[Dict[str, Any]]): Results from the processor if completed
+        result (Optional[ProcessingResult]): Results from the processor if completed
         error (Optional[str]): Error message if job failed
         start_time (Optional[datetime]): When the job started processing
         end_time (Optional[datetime]): When the job finished (success or failure)
@@ -47,7 +56,7 @@ class Job:
         self.processor = processor
         self.params = params
         self.status = JobStatus.PENDING
-        self.result: Optional[Dict[str, Any]] = None
+        self.result: Optional[ProcessingResult] = None
         self.error: Optional[str] = None
         self.start_time: Optional[datetime] = None
         self.end_time: Optional[datetime] = None
@@ -122,58 +131,95 @@ class JobManager:
             a worker thread becomes available.
         """
         if cls._executor is None:
+            logger.error("JobManager not initialized")
             raise RuntimeError("JobManager not initialized")
 
+        logger.info(f"Submitting new job {job_id}")
         job = Job(job_id, processor, params)
         cls._jobs[job_id] = job
 
         async def run_job():
             try:
+                logger.info(f"Starting job {job_id}")
                 job.status = JobStatus.RUNNING
                 job.start_time = datetime.utcnow()
                 
-                # Execute the processor
-                job.result = await processor(**params)
+                logger.info(f"Processing job {job_id} with parameters: {params}")
+                result = await processor(**params)
+                
+                # Check if the result indicates an error
+                if isinstance(result, dict) and result.get('status') == 'error':
+                    raise Exception(result.get('message', 'Unknown error occurred'))
+                elif isinstance(result, ProcessingResult) and result.status == 'error':
+                    raise Exception(result.message)
+                
+                # If no error, format successful result
+                if isinstance(result, dict):
+                    job.result = ProcessingResult(
+                        status="success",
+                        message="Processing completed successfully",
+                        output_path=result.get('output_path'),
+                        metadata=result.get('metadata', {})
+                    )
+                elif isinstance(result, ProcessingResult):
+                    job.result = result
+                else:
+                    job.result = ProcessingResult(
+                        status="success",
+                        message="Processing completed successfully",
+                        output_path=None,
+                        metadata={'raw_result': result}
+                    )
                 
                 job.status = JobStatus.COMPLETED
+                logger.info(f"Job {job_id} completed successfully")
+                
             except Exception as e:
                 job.status = JobStatus.FAILED
                 job.error = str(e)
-                logger.error(f"Job {job_id} failed: {e}")
+                logger.error(f"Job {job_id} failed: {str(e)}")
+                job.result = ProcessingResult(
+                    status="error",
+                    message=str(e),
+                    output_path=None,
+                    metadata={}
+                )
             finally:
                 job.end_time = datetime.utcnow()
+                duration = job.end_time - job.start_time
+                logger.info(f"Job {job_id} finished in {duration.total_seconds():.2f} seconds")
 
         asyncio.create_task(run_job())
         return job_id
 
     @classmethod
     def get_job_status(cls, job_id: str) -> Dict[str, Any]:
-        """Get the current status of a job.
-        
-        Args:
-            job_id (str): ID of the job to check
-            
-        Returns:
-            Dict[str, Any]: Job status information including:
-                - job_id: The job's unique identifier
-                - status: Current job status
-                - result: Processing results if completed
-                - error: Error message if failed
-                - start_time: When the job started
-                - end_time: When the job finished
-                
-        Raises:
-            KeyError: If the job ID is not found
-        """
+        """Get the current status of a job."""
         if job_id not in cls._jobs:
+            logger.warning(f"Attempted to get status for non-existent job {job_id}")
             raise KeyError(f"Job {job_id} not found")
         
         job = cls._jobs[job_id]
+        logger.debug(f"Retrieved status for job {job_id}: {job.status.value}")
+        
+        # Format the result properly
+        result_dict = None
+        if job.result and isinstance(job.result, ProcessingResult):
+            result_dict = {
+                'status': job.result.status,
+                'message': job.result.message,
+                'output_path': job.result.output_path,
+                'metadata': job.result.metadata
+            }
+        
+        # Ensure error is a string for failed jobs, None otherwise
+        error_message = str(job.error) if job.status == JobStatus.FAILED and job.error else None
+        
         return {
             "job_id": job.job_id,
             "status": job.status.value,
-            "result": job.result,
-            "error": job.error,
+            "result": result_dict,
+            "error": error_message,
             "start_time": job.start_time.isoformat() if job.start_time else None,
             "end_time": job.end_time.isoformat() if job.end_time else None
         }
@@ -185,4 +231,6 @@ class JobManager:
         Returns:
             List[Dict[str, Any]]: List of status information for all jobs
         """
+        job_count = len(cls._jobs)
+        logger.debug(f"Listing all jobs. Total count: {job_count}")
         return [cls.get_job_status(job_id) for job_id in cls._jobs]

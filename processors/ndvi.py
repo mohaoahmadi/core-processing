@@ -12,6 +12,7 @@ from pathlib import Path
 import tempfile
 import os
 from typing import Dict, Any
+import logging
 
 from processors.base import BaseProcessor, ProcessingResult
 from lib.s3_manager import upload_file, download_file
@@ -19,6 +20,7 @@ from utils.geo_utils import normalize_array
 from config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 class NDVIProcessor(BaseProcessor):
     """Processor for calculating Normalized Difference Vegetation Index.
@@ -74,27 +76,45 @@ class NDVIProcessor(BaseProcessor):
             - NDVI values of -1 to 1 are mapped to 0-255
             - The formula used is: output = (NDVI + 1) * 127.5
         """
+        logger.info("Starting NDVI calculation process")
+        
         input_path: str = kwargs["input_path"]
         output_name: str = kwargs["output_name"]
         red_band: int = kwargs["red_band"]
         nir_band: int = kwargs["nir_band"]
         
-        # Create output directory if it doesn't exist
+        logger.debug(f"Processing parameters - Input: {input_path}, Output: {output_name}")
+        logger.debug(f"Band configuration - Red: {red_band}, NIR: {nir_band}")
+        
+        # Create output directory
         output_dir = Path(settings.TEMP_DIR) / "ndvi"
         output_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Created output directory: {output_dir}")
         
         output_path = output_dir / f"{output_name}.tif"
+        logger.debug(f"Output will be saved to: {output_path}")
         
-        # If input is S3 path, download it first
+        # Handle S3 input
         temp_input = None
-        if input_path.startswith("s3://"):
-            # Extract the key from s3://bucket/key
+        if input_path.startswith("s3://") or not input_path.startswith("/"):
+            logger.info(f"Input is from S3: {input_path}")
+            # Extract the key from s3://bucket/key or use as is
             s3_key = input_path.split('/', 3)[3] if input_path.startswith("s3://") else input_path
+            logger.debug(f"Extracted S3 key: {s3_key}")
+            
             temp_input = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
             temp_input_path = temp_input.name
             temp_input.close()
-            await download_file(s3_key, temp_input_path)
-            input_path = temp_input_path
+            logger.debug(f"Created temporary file for download: {temp_input_path}")
+            
+            try:
+                logger.info(f"Attempting to download from S3: {s3_key}")
+                await download_file(s3_key, temp_input_path)
+                input_path = temp_input_path
+                logger.info("S3 file downloaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to download from S3: {str(e)}")
+                raise
         
         try:
             with rasterio.open(input_path) as src:

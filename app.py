@@ -84,10 +84,16 @@ class JobStatusResponse(BaseModel):
     """
     job_id: str
     status: str
-    result: Dict[str, Any] = None
-    error: str = None
-    start_time: str = None
-    end_time: str = None
+    result: Dict[str, Any] | None = None
+    error: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+
+    class Config:
+        # Allow null values for optional fields
+        json_encoders = {
+            type(None): lambda _: None
+        }
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -144,51 +150,53 @@ async def create_job(
     job_request: ProcessingJobRequest,
     background_tasks: BackgroundTasks
 ):
-    """Create a new processing job.
+    """Create a new processing job."""
+    logger.info(f"Received job request - Process Type: {job_request.process_type}")
+    logger.debug(f"Full job request details: {job_request.dict()}")
     
-    Args:
-        job_request (ProcessingJobRequest): Job creation request
-        background_tasks (BackgroundTasks): FastAPI background tasks handler
+    try:
+        job_id = str(uuid.uuid4())
+        logger.debug(f"Generated job ID: {job_id}")
         
-    Returns:
-        Dict[str, str]: Dictionary containing the job ID
+        # Select processor
+        processor_map = {
+            "landcover": LandCoverProcessor(),
+            "ndvi": NDVIProcessor(),
+            "orthomosaic": OrthomosaicProcessor()
+        }
         
-    Raises:
-        HTTPException: If process type is unsupported
+        if job_request.process_type not in processor_map:
+            logger.error(f"Invalid process type requested: {job_request.process_type}")
+            raise HTTPException(status_code=400, detail=f"Unsupported process type: {job_request.process_type}")
         
-    Note:
-        The job is processed asynchronously in the background.
-        The client should poll the job status endpoint for results.
-    """
-    job_id = str(uuid.uuid4())
-    
-    # Select the appropriate processor based on process_type
-    processor_map = {
-        "landcover": LandCoverProcessor(),
-        "ndvi": NDVIProcessor(),
-        "orthomosaic": OrthomosaicProcessor()
-    }
-    
-    if job_request.process_type not in processor_map:
-        raise HTTPException(status_code=400, detail=f"Unsupported process type: {job_request.process_type}")
-    
-    processor = processor_map[job_request.process_type]
-    
-    # Prepare path parameters
-    s3_key = f"raw-imagery/{job_request.org_id}/{job_request.project_id}/{job_request.input_file}"
-    output_name = f"{job_request.project_id}_{job_request.process_type}_{job_id[:8]}"
-    
-    # Prepare parameters based on process type
-    params = {
-        "input_path": s3_key,
-        "output_name": output_name,
-        **job_request.parameters
-    }
-    
-    # Submit the job
-    await JobManager.submit_job(job_id, processor, params)
-    
-    return {"job_id": job_id}
+        processor = processor_map[job_request.process_type]
+        logger.debug(f"Selected processor: {processor.__class__.__name__}")
+        
+        # Prepare parameters
+        s3_key = f"{job_request.org_id}/{job_request.project_id}/{job_request.input_file}"
+        output_name = f"{job_request.project_id}_{job_request.process_type}_{job_id[:8]}"
+        
+        logger.debug(f"Prepared S3 key: {s3_key}")
+        logger.debug(f"Prepared output name: {output_name}")
+        
+        params = {
+            "input_path": s3_key,
+            "output_name": output_name,
+            **job_request.parameters
+        }
+        
+        logger.debug(f"Final processing parameters: {params}")
+        
+        # Submit job
+        logger.info(f"Submitting job {job_id} to JobManager")
+        await JobManager.submit_job(job_id, processor, params)
+        
+        logger.info(f"Job {job_id} submitted successfully")
+        return {"job_id": job_id}
+        
+    except Exception as e:
+        logger.error(f"Error creating job: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get(f"{settings.API_V1_PREFIX}/jobs/{{job_id}}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
@@ -226,7 +234,20 @@ async def list_jobs():
         Returns status information for all jobs in the system,
         ordered by creation time (newest first).
     """
-    return JobManager.list_jobs()
+    jobs = JobManager.list_jobs()
+    # Ensure each job matches the JobStatusResponse model
+    formatted_jobs = []
+    for job in jobs:
+        formatted_job = JobStatusResponse(
+            job_id=job["job_id"],
+            status=job["status"],
+            result=job["result"],
+            error=job["error"] if job["error"] is not None else None,
+            start_time=job["start_time"],
+            end_time=job["end_time"]
+        )
+        formatted_jobs.append(formatted_job)
+    return formatted_jobs
 
 # GeoServer integration endpoints
 @app.post(f"{settings.API_V1_PREFIX}/geoserver/publish")
@@ -280,4 +301,4 @@ async def publish_to_geoserver(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=settings.DEBUG)
