@@ -12,26 +12,101 @@ from pathlib import Path
 import logging
 from typing import Dict, Any, List, Tuple, Optional, Union
 import numpy as np
+import sys
 
 from processors.base import BaseProcessor, ProcessingResult
 from lib.s3_manager import upload_file, download_file
 from utils.geo_utils import normalize_array
 from config import get_settings
 
-# Import PyQGIS modules
+# Setup QGIS environment variables and paths
+QGIS_AVAILABLE = False
 try:
+    # Try to detect QGIS installation path
+    qgis_paths = [
+        # Linux paths
+        '/usr/share/qgis',
+        '/usr/local/share/qgis',
+        # Windows paths
+        'C:\\Program Files\\QGIS 3.22',
+        'C:\\Program Files\\QGIS 3.28',
+        # macOS paths
+        '/Applications/QGIS.app/Contents/MacOS',
+        '/Applications/QGIS-LTR.app/Contents/MacOS'
+    ]
+    
+    qgis_path = None
+    for path in qgis_paths:
+        if os.path.exists(path):
+            qgis_path = path
+            break
+    
+    if qgis_path:
+        # Set environment variables
+        os.environ['QGIS_PREFIX_PATH'] = qgis_path
+        
+        # Add QGIS Python bindings to path
+        if sys.platform == 'win32':  # Windows
+            pyqgis_path = os.path.join(qgis_path, 'python')
+            if os.path.exists(pyqgis_path):
+                sys.path.insert(0, pyqgis_path)
+        elif sys.platform == 'darwin':  # macOS
+            pyqgis_path = os.path.join(qgis_path, 'Python3')
+            if os.path.exists(pyqgis_path):
+                sys.path.insert(0, pyqgis_path)
+        else:  # Linux
+            # Try common Linux paths for QGIS Python
+            for py_path in ['/usr/share/qgis/python', '/usr/local/share/qgis/python']:
+                if os.path.exists(py_path):
+                    sys.path.insert(0, py_path)
+                    break
+    
+    # Now try to import QGIS modules
     from qgis.core import (
         QgsApplication,
         QgsRasterLayer,
-        QgsRasterCalculator,
-        QgsRasterCalculatorEntry,
         QgsCoordinateReferenceSystem,
         QgsProject
     )
+    
+    # Try to import QgsRasterCalculator - it might be in a different location in some QGIS versions
+    try:
+        from qgis.core import QgsRasterCalculator, QgsRasterCalculatorEntry
+    except ImportError:
+        # Try alternative import locations for different QGIS versions
+        try:
+            from qgis.analysis import QgsRasterCalculator, QgsRasterCalculatorEntry
+            logging.info("QgsRasterCalculator imported from qgis.analysis")
+        except ImportError:
+            # Create a fallback implementation if needed
+            class QgsRasterCalculatorEntry:
+                def __init__(self):
+                    self.ref = ""
+                    self.raster = None
+                    self.bandNumber = 0
+            
+            class QgsRasterCalculator:
+                def __init__(self, expression, output_file, output_format, extent, width, height, entries):
+                    self.expression = expression
+                    self.output_file = output_file
+                    self.output_format = output_format
+                    self.extent = extent
+                    self.width = width
+                    self.height = height
+                    self.entries = entries
+                
+                def processCalculation(self):
+                    logging.error("QgsRasterCalculator not available in this QGIS version")
+                    return 1  # Error code
+            
+            logging.warning("Using fallback implementation for QgsRasterCalculator")
+    
     QGIS_AVAILABLE = True
-except ImportError:
+    logging.info("PyQGIS modules imported successfully")
+except ImportError as e:
     QGIS_AVAILABLE = False
-    logging.warning("PyQGIS not available. Health indices processor will not work.")
+    logging.warning(f"PyQGIS not available. Health indices processor will not work. Error: {str(e)}")
+    logging.warning("Make sure QGIS is installed and properly configured.")
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -67,6 +142,12 @@ HEALTH_INDICES = {
         'help': 'Normalized Difference Vegetation Index using blue band shows the amount of green vegetation.',
         'range': (-1, 1),
         'bands': ['N', 'B']
+    },
+    'CNDVI': {
+        'expr': '(N - C) / (N + C)',
+        'help': 'Coastal Normalized Difference Vegetation Index uses the coastal band instead of red, useful for shallow water vegetation mapping.',
+        'range': (-1, 1),
+        'bands': ['N', 'C']
     },
     'ENDVI': {
         'expr': '((N + G) - (2 * B)) / ((N + G) + (2 * B))',
@@ -181,13 +262,17 @@ HEALTH_INDICES = {
 # Default band mapping for common satellite sensors
 DEFAULT_BAND_MAPPINGS = {
     'WV3': {  # WorldView-3
+        'C': 1,  # Coastal
         'B': 2,  # Blue
         'G': 3,  # Green
+        'Y': 4,  # Yellow
         'R': 5,  # Red
         'Re': 6,  # Red Edge
-        'N': 7,  # NIR
+        'N': 7,  # NIR1
+        'N2': 8,  # NIR2
     },
     'S2': {  # Sentinel-2
+        'C': 1,  # Coastal/Aerosol
         'B': 2,  # Blue
         'G': 3,  # Green
         'R': 4,  # Red
@@ -195,6 +280,7 @@ DEFAULT_BAND_MAPPINGS = {
         'N': 8,  # NIR
     },
     'L8': {  # Landsat 8
+        'C': 1,  # Coastal/Aerosol
         'B': 2,  # Blue
         'G': 3,  # Green
         'R': 4,  # Red
@@ -223,10 +309,20 @@ class HealthIndicesProcessor(BaseProcessor):
         self.temp_files = []
         
         if QGIS_AVAILABLE:
-            # Initialize QGIS in headless mode
-            self.qgis_app = QgsApplication([], False)
-            self.qgis_app.initQgis()
-            logger.info("QGIS initialized successfully in headless mode")
+            try:
+                # Initialize QGIS in headless mode
+                os.environ["QT_QPA_PLATFORM"] = "offscreen"  # Force offscreen rendering
+                self.qgis_app = QgsApplication([], False)
+                self.qgis_app.setPrefixPath(os.environ.get('QGIS_PREFIX_PATH', '/usr'), True)
+                self.qgis_app.initQgis()
+                
+                # Create a project instance to avoid segmentation faults
+                self.project = QgsProject.instance()
+                
+                logger.info("QGIS initialized successfully in headless mode")
+            except Exception as e:
+                logger.error(f"Failed to initialize QGIS: {str(e)}", exc_info=True)
+                self.qgis_app = None
         else:
             logger.warning("PyQGIS not available. Health indices processor will not work.")
 
@@ -366,6 +462,49 @@ class HealthIndicesProcessor(BaseProcessor):
                     message=f"Failed to download input file from S3: {str(e)}"
                 )
         
+        # Check the input raster and verify band mapping
+        try:
+            # Try using GDAL first to check the raster
+            try:
+                from osgeo import gdal
+                ds = gdal.Open(local_input_path)
+                if ds is None:
+                    logger.error(f"Failed to open raster with GDAL: {local_input_path}")
+                    return ProcessingResult(
+                        status="error",
+                        message=f"Failed to open raster with GDAL: {local_input_path}"
+                    )
+                
+                # Get band count
+                band_count = ds.RasterCount
+                logger.info(f"Input raster has {band_count} bands")
+                
+                # Check if band mapping is valid
+                invalid_bands = []
+                for band_name, band_number in band_mapping.items():
+                    if band_number < 1 or band_number > band_count:
+                        invalid_bands.append((band_name, band_number))
+                
+                if invalid_bands:
+                    error_msg = f"Invalid band mapping: {invalid_bands}. Raster has {band_count} bands."
+                    logger.error(error_msg)
+                    return ProcessingResult(
+                        status="error",
+                        message=error_msg
+                    )
+                
+                # Close the dataset
+                ds = None
+            except ImportError:
+                logger.warning("GDAL not available for raster checking")
+        
+        except Exception as e:
+            logger.error(f"Error checking input raster: {str(e)}", exc_info=True)
+            return ProcessingResult(
+                status="error",
+                message=f"Error checking input raster: {str(e)}"
+            )
+        
         try:
             # Load the input raster
             raster_layer = QgsRasterLayer(local_input_path, "input_raster")
@@ -380,6 +519,51 @@ class HealthIndicesProcessor(BaseProcessor):
             extent = raster_layer.extent()
             width = raster_layer.width()
             height = raster_layer.height()
+            
+            # Check if QgsRasterCalculator is properly working
+            calculator_working = True
+            try:
+                # Create a simple test calculation to verify QgsRasterCalculator works
+                test_entry = QgsRasterCalculatorEntry()
+                test_entry.ref = "test"
+                test_entry.raster = raster_layer
+                test_entry.bandNumber = 1
+                
+                test_output = str(output_dir / "test_calc.tif")
+                test_calc = QgsRasterCalculator(
+                    "test",
+                    test_output,
+                    "GTiff",
+                    extent,
+                    width,
+                    height,
+                    [test_entry]
+                )
+                
+                # Just check if the object is properly initialized
+                if not hasattr(test_calc, 'processCalculation') or not callable(getattr(test_calc, 'processCalculation')):
+                    calculator_working = False
+                    logger.warning("QgsRasterCalculator is not properly working")
+            except Exception as e:
+                calculator_working = False
+                logger.warning(f"QgsRasterCalculator test failed: {str(e)}")
+            
+            # If QgsRasterCalculator is not working, try to use GDAL directly
+            if not calculator_working:
+                logger.info("Attempting to use GDAL directly for calculations")
+                try:
+                    # Import numpy here to ensure it's available in this scope
+                    import numpy as np
+                    from osgeo import gdal
+                except ImportError:
+                    try:
+                        from osgeo import gdal
+                        import numpy as np
+                    except ImportError:
+                        return ProcessingResult(
+                            status="error",
+                            message="Neither QgsRasterCalculator nor GDAL is available for calculations"
+                        )
             
             # Create raster calculator entries
             entries = {}
@@ -417,20 +601,150 @@ class HealthIndicesProcessor(BaseProcessor):
                 # Create list of entries for this calculation
                 calc_entries = [entries[band] for band in required_bands]
                 
-                # Run the calculation
-                calc = QgsRasterCalculator(
-                    expr,
-                    output_path,
-                    "GTiff",
-                    extent,
-                    width,
-                    height,
-                    calc_entries
-                )
+                calculation_success = False
                 
-                result = calc.processCalculation()
-                if result != 0:
-                    logger.error(f"Calculation for {index_name} failed with error code {result}")
+                # Try using QgsRasterCalculator if it's working
+                if calculator_working:
+                    # Run the calculation
+                    calc = QgsRasterCalculator(
+                        expr,
+                        output_path,
+                        "GTiff",
+                        extent,
+                        width,
+                        height,
+                        calc_entries
+                    )
+                    
+                    result = calc.processCalculation()
+                    if result == 0:
+                        calculation_success = True
+                    else:
+                        logger.warning(f"QgsRasterCalculator failed for {index_name} with error code {result}, trying GDAL")
+                
+                # If QgsRasterCalculator failed or is not available, try GDAL
+                if not calculation_success:
+                    try:
+                        logger.info(f"Attempting GDAL calculation for {index_name}")
+                        # Import numpy here to ensure it's available in this scope
+                        import numpy as np
+                        from osgeo import gdal
+                        
+                        # Open the dataset
+                        ds = gdal.Open(local_input_path)
+                        if ds is None:
+                            logger.error(f"Failed to open raster with GDAL: {local_input_path}")
+                            continue
+                        
+                        # Read band data into numpy arrays
+                        band_arrays = {}
+                        for band_name, band_number in band_mapping.items():
+                            if band_name in required_bands:
+                                try:
+                                    # GDAL bands are 1-indexed
+                                    band = ds.GetRasterBand(band_number)
+                                    if band is None:
+                                        logger.error(f"Band {band_number} not found in raster")
+                                        continue
+                                    
+                                    # Read data and handle no data values
+                                    data = band.ReadAsArray().astype(np.float32)
+                                    logger.debug(f"Band {band_name} data shape: {data.shape}")
+                                    
+                                    nodata = band.GetNoDataValue()
+                                    if nodata is not None:
+                                        # Replace nodata with nan
+                                        data = np.where(data == nodata, np.nan, data)
+                                    
+                                    band_arrays[band_name] = data
+                                    logger.info(f"Successfully read band {band_name} (#{band_number})")
+                                except Exception as e:
+                                    logger.error(f"Error reading band {band_number}: {str(e)}")
+                                    raise
+                        
+                        # Check if all required bands were read successfully
+                        missing_bands = [band for band in required_bands if band not in band_arrays]
+                        if missing_bands:
+                            logger.error(f"Missing bands for GDAL calculation: {missing_bands}")
+                            continue
+                        
+                        # Log band statistics for debugging
+                        for band_name, array in band_arrays.items():
+                            valid_data = array[~np.isnan(array)]
+                            if len(valid_data) > 0:
+                                logger.info(f"Band {band_name} stats: min={np.min(valid_data):.4f}, max={np.max(valid_data):.4f}, mean={np.mean(valid_data):.4f}")
+                            else:
+                                logger.warning(f"Band {band_name} has no valid data")
+                        
+                        # Create a safe environment for eval
+                        safe_dict = {
+                            'np': np,
+                            'sqrt': np.sqrt,
+                            'abs': np.abs,
+                            'min': np.minimum,
+                            'max': np.maximum,
+                            'exp': np.exp,
+                            'log': np.log,
+                            'sin': np.sin,
+                            'cos': np.cos,
+                            'tan': np.tan
+                        }
+                        
+                        # Add band arrays to the safe dict
+                        for band_name, array in band_arrays.items():
+                            safe_dict[band_name] = array
+                        
+                        # Convert QGIS expression to numpy expression
+                        numpy_expr = expr.replace('^', '**')  # Replace power operator
+                        logger.info(f"Evaluating expression: {numpy_expr}")
+                        
+                        try:
+                            # Calculate the index
+                            result_array = eval(numpy_expr, {"__builtins__": {}}, safe_dict)
+                            
+                            # Handle NaN and Inf values
+                            result_array = np.nan_to_num(result_array, nan=0.0, posinf=1.0, neginf=-1.0)
+                            
+                            # Log result statistics
+                            logger.info(f"Result stats: min={np.min(result_array):.4f}, max={np.max(result_array):.4f}, mean={np.mean(result_array):.4f}")
+                            
+                            # Create output raster
+                            driver = gdal.GetDriverByName('GTiff')
+                            out_ds = driver.Create(output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32,
+                                                  options=['COMPRESS=LZW', 'TILED=YES'])
+                            
+                            if out_ds is None:
+                                logger.error(f"Failed to create output raster: {output_path}")
+                                continue
+                            
+                            # Set projection and geotransform
+                            out_ds.SetProjection(ds.GetProjection())
+                            out_ds.SetGeoTransform(ds.GetGeoTransform())
+                            
+                            # Write data
+                            out_band = out_ds.GetRasterBand(1)
+                            out_band.WriteArray(result_array)
+                            
+                            # Set nodata value
+                            out_band.SetNoDataValue(0.0)
+                            
+                            # Clean up
+                            out_band = None
+                            out_ds = None
+                            
+                            calculation_success = True
+                            logger.info(f"Successfully calculated {index_name} using GDAL")
+                        except Exception as e:
+                            logger.error(f"Error evaluating expression: {str(e)}", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"GDAL calculation failed for {index_name}: {str(e)}", exc_info=True)
+                    finally:
+                        # Make sure to close the dataset
+                        if 'ds' in locals() and ds is not None:
+                            ds = None
+                
+                if not calculation_success:
+                    logger.error(f"All calculation methods failed for {index_name}")
                     continue
                 
                 # Upload to S3
@@ -495,5 +809,14 @@ class HealthIndicesProcessor(BaseProcessor):
         
         # Shutdown QGIS if it was initialized
         if self.qgis_app is not None:
-            self.qgis_app.exitQgis()
-            logger.info("QGIS shutdown completed") 
+            try:
+                # Clear the project first
+                if hasattr(self, 'project') and self.project is not None:
+                    self.project.clear()
+                
+                # Exit QGIS
+                self.qgis_app.exitQgis()
+                self.qgis_app = None
+                logger.info("QGIS shutdown completed")
+            except Exception as e:
+                logger.error(f"Error during QGIS shutdown: {str(e)}", exc_info=True) 

@@ -3,6 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+*.tif
+*.tif.aux.xml
+*.tif.ovr
+*.tif.ovr.aux.xml
+*.tif.ovr.ovr
+*.tif.ovr.ovr.aux.xml
+*.tif.ovr.ovr.ovr.aux.xml
+
 # C extensions
 *.so
 

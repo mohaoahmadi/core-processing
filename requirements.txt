@@ -12,6 +12,3 @@ requests>=2.31.0
 python-multipart>=0.0.6
 loguru>=0.7.2
 shapely>=2.0.2
-# PyQGIS dependencies - Note: QGIS itself needs to be installed separately
-pyqgis-plugin>=0.1.0  # Python bindings for QGIS
-qgis-processing>=3.22.0  # QGIS processing algorithms 
