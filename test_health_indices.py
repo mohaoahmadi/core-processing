@@ -91,12 +91,34 @@ def parse_band_mapping(band_str: str) -> Dict[str, int]:
     
     return band_mapping
 
-async def test_health_indices(input_path: str, band_mapping: Dict[str, int] = None) -> None:
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Test health indices processor")
+    parser.add_argument("input_path", help="Path to input GeoTIFF file")
+    parser.add_argument("--bands", help="Custom band mapping (e.g., 'N=1,R=2,G=3,B=4')")
+    parser.add_argument("--org-id", help="Organization ID for S3 path structure")
+    parser.add_argument("--project-id", help="Project ID for S3 path structure")
+    
+    args = parser.parse_args()
+    
+    if not os.path.isfile(args.input_path):
+        logger.error(f"Error: File not found: {args.input_path}")
+        sys.exit(1)
+    
+    # Parse band mapping if provided
+    band_mapping = parse_band_mapping(args.bands) if args.bands else None
+    
+    return args, band_mapping
+
+async def test_health_indices(input_path: str, band_mapping: Dict[str, int] = None, 
+                             org_id: str = None, project_id: str = None) -> None:
     """Test the health indices processor with a sample file.
     
     Args:
         input_path: Path to a sample GeoTIFF file
         band_mapping: Optional custom band mapping
+        org_id: Optional organization ID for S3 path structure
+        project_id: Optional project ID for S3 path structure
     """
     logger.info(f"Testing health indices processor with {input_path}")
     
@@ -110,14 +132,20 @@ async def test_health_indices(input_path: str, band_mapping: Dict[str, int] = No
     if band_mapping:
         logger.info(f"Using custom band mapping: {band_mapping}")
     
+    # Log if we're using organization/project structure
+    if org_id and project_id:
+        logger.info(f"Using organization/project structure: org_id={org_id}, project_id={project_id}")
+    
     try:
         # Process the image
         result = await processor(
-            input_path=input_path,
+            input_path=input_path,  # Use the original input path
             output_dir="test_indices",
             indices=test_indices,
             sensor_type="WV3",  # Assuming WorldView-3 imagery
-            band_mapping=band_mapping
+            band_mapping=band_mapping,
+            org_id=org_id,  # Pass org_id directly
+            project_id=project_id  # Pass project_id directly
         )
         
         # Print results
@@ -140,20 +168,15 @@ async def test_health_indices(input_path: str, band_mapping: Dict[str, int] = No
 
 def main() -> None:
     """Main entry point for the script."""
-    parser = argparse.ArgumentParser(description="Test health indices processor")
-    parser.add_argument("input_path", help="Path to input GeoTIFF file")
-    parser.add_argument("--bands", help="Custom band mapping (e.g., 'N=1,R=2,G=3,B=4')")
+    args, band_mapping = parse_args()
     
-    args = parser.parse_args()
-    
-    if not os.path.isfile(args.input_path):
-        logger.error(f"Error: File not found: {args.input_path}")
-        sys.exit(1)
-    
-    # Parse band mapping if provided
-    band_mapping = parse_band_mapping(args.bands) if args.bands else None
-    
-    asyncio.run(test_health_indices(args.input_path, band_mapping))
+    # Run the test with the provided arguments
+    asyncio.run(test_health_indices(
+        args.input_path, 
+        band_mapping,
+        org_id=args.org_id,
+        project_id=args.project_id
+    ))
 
 if __name__ == "__main__":
     main() 

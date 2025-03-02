@@ -199,3 +199,26 @@ async def get_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
     except Exception as e:
         logger.error(f"Error in URL generation thread: {str(e)}")
         raise
+
+def download_file_sync(s3_key: str, local_path: str) -> None:
+    """Download a file from S3 to a local path (synchronous version).
+    
+    Args:
+        s3_key (str): S3 key of the file to download
+        local_path (str): Local path to save the file
+        
+    Raises:
+        Exception: If the download fails
+    """
+    try:
+        logger.info(f"Downloading {s3_key} to {local_path}")
+        s3_client = get_s3_client()
+        s3_client.download_file(
+            Bucket=get_settings().S3_BUCKET_NAME,
+            Key=s3_key,
+            Filename=local_path
+        )
+        logger.info(f"Download completed: {local_path}")
+    except Exception as e:
+        logger.error(f"Error downloading file from S3: {str(e)}")
+        raise Exception(f"Failed to download file from S3: {str(e)}")

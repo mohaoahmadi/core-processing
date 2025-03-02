@@ -240,4 +240,162 @@ def calculate_slope(
     """
     dy, dx = np.gradient(dem, resolution)
     slope = np.degrees(np.arctan(np.sqrt(dx*dx + dy*dy)))
-    return slope 
+    return slope
+
+async def analyze_geotiff(file_path: str) -> dict:
+    """Analyze a GeoTIFF file and return its metadata and band information.
+    
+    Args:
+        file_path (str): Path to the GeoTIFF file (local or S3 path)
+        
+    Returns:
+        dict: Dictionary containing GeoTIFF metadata and band information
+        
+    Raises:
+        Exception: If the file cannot be opened or analyzed
+    """
+    from osgeo import gdal
+    import numpy as np
+    import os
+    from pathlib import Path
+    import tempfile
+    from loguru import logger
+    
+    # Import here to avoid circular imports
+    from lib.s3_manager import download_file
+    from config import get_settings
+    
+    settings = get_settings()
+    local_file_path = file_path
+    temp_file = None
+    
+    try:
+        # Handle S3 paths
+        if file_path.startswith("s3://") or not os.path.isfile(file_path):
+            logger.info(f"Input is from S3 or not a local file: {file_path}")
+            # Extract the key from s3://bucket/key or use as is
+            s3_key = file_path.split('/', 3)[3] if file_path.startswith("s3://") else file_path
+            logger.debug(f"Extracted S3 key: {s3_key}")
+            
+            temp_file = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+            local_file_path = temp_file.name
+            temp_file.close()
+            logger.debug(f"Created temporary file for download: {local_file_path}")
+            
+            try:
+                logger.info(f"Downloading from S3: {s3_key}")
+                await download_file(s3_key, local_file_path)
+                logger.info("S3 file downloaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to download from S3: {str(e)}")
+                raise Exception(f"Failed to download file from S3: {str(e)}")
+        
+        # Open the dataset with GDAL
+        logger.info(f"Opening GeoTIFF file: {local_file_path}")
+        ds = gdal.Open(local_file_path)
+        if ds is None:
+            raise Exception(f"Failed to open GeoTIFF file: {local_file_path}")
+        
+        # Get basic metadata
+        width = ds.RasterXSize
+        height = ds.RasterYSize
+        band_count = ds.RasterCount
+        projection = ds.GetProjection()
+        geotransform = ds.GetGeoTransform()
+        
+        # Calculate bounding box
+        minx = geotransform[0]
+        maxy = geotransform[3]
+        maxx = minx + width * geotransform[1]
+        miny = maxy + height * geotransform[5]  # Note: geotransform[5] is negative
+        
+        # Get driver metadata
+        driver = ds.GetDriver().GetDescription()
+        
+        # Get band information
+        bands_info = []
+        for i in range(1, band_count + 1):
+            band = ds.GetRasterBand(i)
+            
+            # Get band statistics
+            stats = band.GetStatistics(True, True)
+            
+            # Get band data type
+            dtype = gdal.GetDataTypeName(band.DataType)
+            
+            # Get nodata value
+            nodata = band.GetNoDataValue()
+            
+            # Get color interpretation
+            color_interp = gdal.GetColorInterpretationName(band.GetColorInterpretation())
+            
+            # Sample a small portion of the band to get a histogram
+            # (avoid reading the entire band which could be large)
+            xoff = width // 4
+            yoff = height // 4
+            win_width = min(width // 2, 1000)  # Limit to 1000 pixels
+            win_height = min(height // 2, 1000)  # Limit to 1000 pixels
+            
+            data = band.ReadAsArray(xoff, yoff, win_width, win_height)
+            
+            # Calculate histogram for the sample
+            hist_min = float(np.nanmin(data)) if data.size > 0 else 0
+            hist_max = float(np.nanmax(data)) if data.size > 0 else 0
+            
+            # Add band info to the list
+            bands_info.append({
+                "band_number": i,
+                "data_type": dtype,
+                "min": float(stats[0]),
+                "max": float(stats[1]),
+                "mean": float(stats[2]),
+                "stddev": float(stats[3]),
+                "nodata_value": float(nodata) if nodata is not None else None,
+                "color_interpretation": color_interp,
+                "histogram": {
+                    "min": hist_min,
+                    "max": hist_max
+                }
+            })
+        
+        # Get metadata items
+        metadata = {}
+        domains = ds.GetMetadataDomainList() or []
+        
+        for domain in domains:
+            domain_metadata = ds.GetMetadata(domain)
+            if domain_metadata:
+                metadata[domain] = domain_metadata
+        
+        # Close the dataset
+        ds = None
+        
+        # Prepare the result
+        result = {
+            "file_path": file_path,
+            "width": width,
+            "height": height,
+            "band_count": band_count,
+            "driver": driver,
+            "projection": projection,
+            "geotransform": geotransform,
+            "bounds": {
+                "minx": minx,
+                "miny": miny,
+                "maxx": maxx,
+                "maxy": maxy
+            },
+            "bands": bands_info,
+            "metadata": metadata
+        }
+        
+        return result
+    
+    finally:
+        # Clean up temporary file if it exists
+        if temp_file is not None and os.path.exists(local_file_path):
+            try:
+                os.unlink(local_file_path)
+                logger.debug(f"Deleted temporary file: {local_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary file {local_file_path}: {str(e)}") 

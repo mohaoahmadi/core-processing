@@ -336,6 +336,8 @@ class HealthIndicesProcessor(BaseProcessor):
                 indices (List[str], optional): List of indices to calculate (default: all)
                 sensor_type (str, optional): Sensor type for default band mapping (default: "WV3")
                 band_mapping (Dict[str, int], optional): Custom band mapping
+                org_id (str, optional): Organization ID for S3 path structure
+                project_id (str, optional): Project ID for S3 path structure
                 
         Returns:
             bool: True if all required parameters are present and valid
@@ -402,6 +404,8 @@ class HealthIndicesProcessor(BaseProcessor):
                 sensor_type (str, optional): Sensor type for default band mapping (default: "WV3")
                 band_mapping (Dict[str, int], optional): Custom band mapping
                 scale_output (bool, optional): Whether to scale output to 8-bit (default: True)
+                org_id (str, optional): Organization ID for S3 path structure
+                project_id (str, optional): Project ID for S3 path structure
                 
         Returns:
             ProcessingResult: Processing result containing:
@@ -424,6 +428,8 @@ class HealthIndicesProcessor(BaseProcessor):
         sensor_type: str = kwargs.get("sensor_type", "WV3")
         custom_band_mapping: Dict[str, int] = kwargs.get("band_mapping", {})
         scale_output: bool = kwargs.get("scale_output", True)
+        org_id: str = kwargs.get("org_id")
+        project_id: str = kwargs.get("project_id")
         
         # Use custom band mapping if provided, otherwise use default for the sensor type
         band_mapping = custom_band_mapping if custom_band_mapping else DEFAULT_BAND_MAPPINGS.get(sensor_type, {})
@@ -747,8 +753,37 @@ class HealthIndicesProcessor(BaseProcessor):
                     logger.error(f"All calculation methods failed for {index_name}")
                     continue
                 
-                # Upload to S3
-                s3_key = f"{output_dir_name}/{output_filename}"
+                # Use explicitly provided org_id and project_id if available
+                # Otherwise, try to extract them from the input path
+                extracted_org_id = None
+                extracted_project_id = None
+                
+                # Parse the input path to extract org_id and project_id if not explicitly provided
+                if input_path.startswith("s3://"):
+                    # Format: s3://bucket/org-id/project-id/file.tif
+                    parts = input_path.split('/')
+                    if len(parts) >= 5:  # s3://bucket/org-id/project-id/file.tif
+                        extracted_org_id = parts[3]
+                        extracted_project_id = parts[4]
+                elif '/' in input_path:
+                    # Format: org-id/project-id/file.tif
+                    parts = input_path.split('/')
+                    if len(parts) >= 3:
+                        extracted_org_id = parts[0]
+                        extracted_project_id = parts[1]
+                
+                # Use explicitly provided values if available, otherwise use extracted values
+                effective_org_id = org_id if org_id else extracted_org_id
+                effective_project_id = project_id if project_id else extracted_project_id
+                
+                # Construct the S3 key with the health_indices subfolder
+                if effective_org_id and effective_project_id:
+                    s3_key = f"{effective_org_id}/{effective_project_id}/health_indices/{output_filename}"
+                    logger.info(f"Saving to organization/project structure: {s3_key}")
+                else:
+                    s3_key = f"{output_dir_name}/{output_filename}"
+                    logger.info(f"Saving to default location: {s3_key}")
+                
                 s3_path = await upload_file(output_path, s3_key)
                 
                 # Store result information

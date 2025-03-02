@@ -26,8 +26,39 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import uuid
+import os
+import sys
 from typing import List, Dict, Any
 from pydantic import BaseModel
+
+# Initialize GDAL before importing other modules
+try:
+    # Set GDAL environment variables
+    os.environ['GDAL_DATA'] = '/usr/share/gdal'
+    
+    # Try to import and initialize GDAL
+    from osgeo import gdal
+    gdal.AllRegister()  # Register all drivers
+    gdal.UseExceptions()  # Enable exceptions for better error messages
+    
+    # Log GDAL configuration
+    logger.info(f"GDAL version: {gdal.VersionInfo('RELEASE_NAME')}")
+    driver_count = gdal.GetDriverCount()
+    logger.info(f"GDAL driver count: {driver_count}")
+    if driver_count > 0:
+        logger.info(f"Available GDAL drivers: {[gdal.GetDriver(i).ShortName for i in range(min(10, driver_count))]}")
+    else:
+        logger.warning("No GDAL drivers available!")
+    
+    # Check if GTiff driver is available
+    gtiff_driver = gdal.GetDriverByName('GTiff')
+    if gtiff_driver:
+        logger.info("GTiff driver is available")
+    else:
+        logger.warning("GTiff driver is NOT available!")
+except Exception as e:
+    logger.error(f"Error initializing GDAL: {str(e)}")
+    # Don't exit, as the app might still be useful for other endpoints
 
 from config import get_settings
 from lib.supabase_client import init_supabase, get_supabase
@@ -39,6 +70,7 @@ from processors.ndvi import NDVIProcessor
 from processors.orthomosaic import OrthomosaicProcessor
 from processors.health_indices import HealthIndicesProcessor, HEALTH_INDICES
 from utils.logging import setup_logging
+from utils.geo_utils import analyze_geotiff
 
 settings = get_settings()
 
@@ -97,6 +129,18 @@ class JobStatusResponse(BaseModel):
         json_encoders = {
             type(None): lambda _: None
         }
+
+class GeoTiffAnalysisRequest(BaseModel):
+    """Request model for GeoTIFF analysis.
+    
+    Attributes:
+        file_path (str): Path to the GeoTIFF file (local or S3 path)
+        org_id (str, optional): Organization identifier
+        project_id (str, optional): Project identifier
+    """
+    file_path: str
+    org_id: str | None = None
+    project_id: str | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -334,6 +378,217 @@ async def list_sensor_band_mappings():
     except Exception as e:
         logger.error(f"Error listing sensor band mappings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error listing sensor band mappings: {str(e)}")
+
+@app.post(f"{settings.API_V1_PREFIX}/analyze-geotiff", response_model=Dict[str, Any])
+async def analyze_geotiff_endpoint(request: GeoTiffAnalysisRequest):
+    """Analyze a GeoTIFF file and return its metadata and band information.
+    
+    Args:
+        request (GeoTiffAnalysisRequest): Request containing the file path
+        
+    Returns:
+        Dict[str, Any]: Dictionary containing GeoTIFF metadata and band information
+        
+    Raises:
+        HTTPException: If the file cannot be found or analyzed
+    """
+    logger.info(f"Received GeoTIFF analysis request for file: {request.file_path}")
+    
+    try:
+        # Prepare the file path
+        file_path = request.file_path
+        
+        # If org_id and project_id are provided, construct the S3 path
+        if request.org_id and request.project_id:
+            file_path = f"{request.org_id}/{request.project_id}/{request.file_path}"
+            logger.debug(f"Constructed S3 path: {file_path}")
+        
+        # Use a synchronous version of analyze_geotiff for simplicity
+        import numpy as np
+        import os
+        import tempfile
+        
+        local_file_path = file_path
+        temp_file = None
+        
+        try:
+            # Handle S3 paths
+            if file_path.startswith("s3://") or not os.path.isfile(file_path):
+                logger.info(f"Input is from S3 or not a local file: {file_path}")
+                # Extract the key from s3://bucket/key or use as is
+                s3_key = file_path.split('/', 3)[3] if file_path.startswith("s3://") else file_path
+                logger.debug(f"Extracted S3 key: {s3_key}")
+                
+                from lib.s3_manager import download_file_sync
+                
+                temp_file = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+                local_file_path = temp_file.name
+                temp_file.close()
+                logger.debug(f"Created temporary file for download: {local_file_path}")
+                
+                try:
+                    logger.info(f"Downloading from S3: {s3_key}")
+                    download_file_sync(s3_key, local_file_path)
+                    logger.info("S3 file downloaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to download from S3: {str(e)}")
+                    raise Exception(f"Failed to download file from S3: {str(e)}")
+            
+            # Open the dataset with GDAL
+            logger.info(f"Opening GeoTIFF file: {local_file_path}")
+            
+            # Check if file exists and has content
+            if not os.path.exists(local_file_path):
+                raise Exception(f"File does not exist: {local_file_path}")
+                
+            file_size = os.path.getsize(local_file_path)
+            logger.info(f"File size: {file_size} bytes")
+            if file_size == 0:
+                raise Exception(f"File is empty: {local_file_path}")
+                
+            # Try to get file info
+            try:
+                import subprocess
+                file_info = subprocess.check_output(['file', local_file_path]).decode('utf-8')
+                logger.info(f"File info: {file_info}")
+            except Exception as e:
+                logger.warning(f"Could not get file info: {str(e)}")
+            
+            # Try to open with GDAL
+            try:
+                gdal.UseExceptions()  # Enable exceptions for better error messages
+                ds = gdal.Open(local_file_path, gdal.GA_ReadOnly)
+                if ds is None:
+                    error_msg = gdal.GetLastErrorMsg() or "Unknown error"
+                    logger.error(f"Failed to open GeoTIFF file: {local_file_path}. Error: {error_msg}")
+                    raise Exception(f"Failed to open GeoTIFF file: {local_file_path}. Error: {error_msg}")
+            except Exception as e:
+                logger.error(f"GDAL exception: {str(e)}")
+                
+                # Try with rasterio as a fallback
+                try:
+                    import rasterio
+                    logger.info("Trying to open with rasterio as fallback")
+                    with rasterio.open(local_file_path) as src:
+                        # Create a GDAL-like dataset from rasterio
+                        ds = gdal.Open(local_file_path)
+                        if ds is None:
+                            raise Exception("Still failed with GDAL after rasterio check")
+                except ImportError:
+                    logger.error("Rasterio not available for fallback")
+                    raise Exception(f"GDAL error opening file: {str(e)}")
+                except Exception as rio_error:
+                    logger.error(f"Rasterio fallback also failed: {str(rio_error)}")
+                    raise Exception(f"Failed to open file with both GDAL and rasterio: {str(e)}, {str(rio_error)}")
+            
+            # Get basic metadata
+            width = ds.RasterXSize
+            height = ds.RasterYSize
+            band_count = ds.RasterCount
+            projection = ds.GetProjection()
+            geotransform = ds.GetGeoTransform()
+            
+            # Calculate bounding box
+            minx = geotransform[0]
+            maxy = geotransform[3]
+            maxx = minx + width * geotransform[1]
+            miny = maxy + height * geotransform[5]  # Note: geotransform[5] is negative
+            
+            # Get driver metadata
+            driver = ds.GetDriver().GetDescription()
+            
+            # Get band information
+            bands_info = []
+            for i in range(1, band_count + 1):
+                band = ds.GetRasterBand(i)
+                
+                # Get band statistics
+                stats = band.GetStatistics(True, True)
+                
+                # Get band data type
+                dtype = gdal.GetDataTypeName(band.DataType)
+                
+                # Get nodata value
+                nodata = band.GetNoDataValue()
+                
+                # Get color interpretation
+                color_interp = gdal.GetColorInterpretationName(band.GetColorInterpretation())
+                
+                # Sample a small portion of the band to get a histogram
+                # (avoid reading the entire band which could be large)
+                xoff = width // 4
+                yoff = height // 4
+                win_width = min(width // 2, 1000)  # Limit to 1000 pixels
+                win_height = min(height // 2, 1000)  # Limit to 1000 pixels
+                
+                data = band.ReadAsArray(xoff, yoff, win_width, win_height)
+                
+                # Calculate histogram for the sample
+                hist_min = float(np.nanmin(data)) if data.size > 0 else 0
+                hist_max = float(np.nanmax(data)) if data.size > 0 else 0
+                
+                # Add band info to the list
+                bands_info.append({
+                    "band_number": i,
+                    "data_type": dtype,
+                    "min": float(stats[0]),
+                    "max": float(stats[1]),
+                    "mean": float(stats[2]),
+                    "stddev": float(stats[3]),
+                    "nodata_value": float(nodata) if nodata is not None else None,
+                    "color_interpretation": color_interp,
+                    "histogram": {
+                        "min": hist_min,
+                        "max": hist_max
+                    }
+                })
+            
+            # Get metadata items
+            metadata = {}
+            domains = ds.GetMetadataDomainList() or []
+            
+            for domain in domains:
+                domain_metadata = ds.GetMetadata(domain)
+                if domain_metadata:
+                    metadata[domain] = domain_metadata
+            
+            # Close the dataset
+            ds = None
+            
+            # Prepare the result
+            result = {
+                "file_path": file_path,
+                "width": width,
+                "height": height,
+                "band_count": band_count,
+                "driver": driver,
+                "projection": projection,
+                "geotransform": geotransform,
+                "bounds": {
+                    "minx": minx,
+                    "miny": miny,
+                    "maxx": maxx,
+                    "maxy": maxy
+                },
+                "bands": bands_info,
+                "metadata": metadata
+            }
+            
+            logger.info(f"Successfully analyzed GeoTIFF: {request.file_path}")
+            return result
+            
+        finally:
+            # Clean up temporary file if it exists
+            if temp_file is not None and os.path.exists(local_file_path):
+                try:
+                    os.unlink(local_file_path)
+                    logger.debug(f"Deleted temporary file: {local_file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {local_file_path}: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error analyzing GeoTIFF: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error analyzing GeoTIFF: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
