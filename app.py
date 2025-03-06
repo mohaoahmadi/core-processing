@@ -22,7 +22,7 @@ Architecture:
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import uuid
@@ -142,6 +142,20 @@ class GeoTiffAnalysisRequest(BaseModel):
     org_id: str | None = None
     project_id: str | None = None
 
+class PresignedUrlRequest(BaseModel):
+    """Request model for generating a presigned URL for S3 upload.
+    
+    Attributes:
+        filename (str): Name of the file to be uploaded
+        org_id (str): Organization identifier
+        project_id (str): Project identifier
+        content_type (str, optional): MIME type of the file
+    """
+    filename: str
+    org_id: str
+    project_id: str
+    content_type: str = "image/tiff"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events.
@@ -235,6 +249,28 @@ async def create_job(
         
         logger.debug(f"Final processing parameters: {params}")
         
+        # Record the job in Supabase - using the string fields directly, not as UUIDs
+        try:
+            supabase = get_supabase()
+            
+            # Create a proper insert that maps to your table structure
+            # Store project_id as string instead of trying to convert to UUID
+            supabase.table("processing_jobs").insert({
+                "id": job_id,  # This should be UUID format already
+                "project_id": job_request.project_id,  # Store as string
+                "input_file": job_request.input_file,
+                "process_type": job_request.process_type,
+                "parameters": job_request.parameters,
+                "status": "pending",
+                "org_id": job_request.org_id  # Make sure your table has this column
+            }).execute()
+            
+            logger.info(f"Job record created in Supabase")
+        except Exception as db_error:
+            # Log the database error but continue with job processing
+            logger.error(f"Error recording job in database: {str(db_error)}")
+            # Continue processing anyway since the job manager doesn't require db record
+        
         # Submit job
         logger.info(f"Submitting job {job_id} to JobManager")
         await JobManager.submit_job(job_id, processor, params)
@@ -267,14 +303,41 @@ async def get_job_status(job_id: str):
         - Timing information
     """
     try:
-        return JobManager.get_job_status(job_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        # First, try to get job from JobManager
+        try:
+            return JobManager.get_job_status(job_id)
+        except KeyError:
+            # If not found in JobManager, try from Supabase
+            supabase = get_supabase()
+            job_result = supabase.table("processing_jobs").select("*").eq("id", job_id).execute()
+            
+            if not job_result.data:
+                raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+            
+            job = job_result.data[0]
+            
+            # Convert to JobStatusResponse format
+            return JobStatusResponse(
+                job_id=job["id"],
+                status=job["status"],
+                result=job.get("result"),
+                error=job.get("error_message"),
+                start_time=job.get("created_at"),
+                end_time=job.get("completed_at")
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get(f"{settings.API_V1_PREFIX}/jobs", response_model=List[JobStatusResponse])
-async def list_jobs():
+async def list_jobs(project_id: str = None):
     """List all processing jobs.
     
+    Args:
+        project_id (str, optional): Filter jobs by project ID
+        
     Returns:
         List[JobStatusResponse]: List of all jobs and their status
         
@@ -282,20 +345,52 @@ async def list_jobs():
         Returns status information for all jobs in the system,
         ordered by creation time (newest first).
     """
-    jobs = JobManager.list_jobs()
-    # Ensure each job matches the JobStatusResponse model
-    formatted_jobs = []
-    for job in jobs:
-        formatted_job = JobStatusResponse(
-            job_id=job["job_id"],
-            status=job["status"],
-            result=job["result"],
-            error=job["error"] if job["error"] is not None else None,
-            start_time=job["start_time"],
-            end_time=job["end_time"]
-        )
-        formatted_jobs.append(formatted_job)
-    return formatted_jobs
+    try:
+        # Combine jobs from JobManager and Supabase
+        active_jobs = JobManager.list_jobs()
+        
+        # Get historical jobs from Supabase
+        supabase = get_supabase()
+        query = supabase.table("processing_jobs").select("*")
+        
+        if project_id:
+            query = query.eq("project_id", project_id)
+        
+        db_jobs_result = query.order("created_at", desc=True).execute()
+        
+        # Convert Supabase jobs to JobStatusResponse format
+        db_jobs = []
+        for job in db_jobs_result.data:
+            # Skip jobs that are already in active_jobs
+            if any(active_job["job_id"] == job["id"] for active_job in active_jobs):
+                continue
+                
+            db_jobs.append(JobStatusResponse(
+                job_id=job["id"],
+                status=job["status"],
+                result=job.get("result"),
+                error=job.get("error_message"),
+                start_time=job.get("created_at"),
+                end_time=job.get("completed_at")
+            ))
+        
+        # Convert active jobs to JobStatusResponse format
+        formatted_active_jobs = []
+        for job in active_jobs:
+            formatted_active_jobs.append(JobStatusResponse(
+                job_id=job["job_id"],
+                status=job["status"],
+                result=job["result"],
+                error=job["error"] if job["error"] is not None else None,
+                start_time=job["start_time"],
+                end_time=job["end_time"]
+            ))
+        
+        # Combine and return
+        return formatted_active_jobs + db_jobs
+    except Exception as e:
+        logger.error(f"Error listing jobs: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # GeoServer integration endpoints
 @app.post(f"{settings.API_V1_PREFIX}/geoserver/publish")
@@ -332,6 +427,11 @@ async def publish_to_geoserver(
         with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
             tmp_path = tmp.name
         
+        # Extract org_id and project_id from s3_key if possible
+        parts = s3_key.split('/')
+        org_id = parts[0] if len(parts) >= 1 else None
+        project_id = parts[1] if len(parts) >= 2 else None
+        
         # Download the file
         from lib.s3_manager import download_file
         await download_file(s3_key, tmp_path)
@@ -341,6 +441,16 @@ async def publish_to_geoserver(
         
         # Clean up
         Path(tmp_path).unlink(missing_ok=True)
+        
+        # Record layer in Supabase
+        supabase = get_supabase()
+        supabase.table("geoserver_layers").insert({
+            "layer_name": layer_name,
+            "workspace": workspace or settings.GEOSERVER_WORKSPACE,
+            "s3_key": s3_key,
+            "org_id": org_id,
+            "project_id": project_id
+        }).execute()
         
         return result
     except Exception as e:
@@ -590,6 +700,280 @@ async def analyze_geotiff_endpoint(request: GeoTiffAnalysisRequest):
         logger.error(f"Error analyzing GeoTIFF: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error analyzing GeoTIFF: {str(e)}")
 
+@app.post(f"{settings.API_V1_PREFIX}/uploads/request-url", response_model=Dict[str, str])
+async def get_upload_url(request: PresignedUrlRequest):
+    """Get a presigned URL for direct upload to S3.
+    
+    Args:
+        request (PresignedUrlRequest): Request with file details
+        
+    Returns:
+        dict: Presigned URL and S3 key
+        
+    Raises:
+        HTTPException: If URL generation fails
+    """
+    try:
+        # Generate S3 key
+        s3_key = f"{request.org_id}/{request.project_id}/raw/{request.filename}"
+        
+        # Generate presigned URL for PUT operation
+        presigned_url = await get_presigned_url(s3_key, http_method="PUT", expires_in=3600)
+        
+        # Record the upload request in Supabase
+        supabase = get_supabase()
+        supabase.table("file_uploads").insert({
+            "id": str(uuid.uuid4()),
+            "filename": request.filename,
+            "s3_key": s3_key,
+            "org_id": request.org_id,
+            "project_id": request.project_id,
+            "content_type": request.content_type,
+            "status": "pending"
+        }).execute()
+        
+        return {
+            "upload_url": presigned_url,
+            "s3_key": s3_key,
+            "expires_in": 3600
+        }
+    except Exception as e:
+        logger.error(f"Error generating presigned URL: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post(f"{settings.API_V1_PREFIX}/uploads/complete")
+async def complete_upload(s3_key: str, file_size: int = 0):
+    """Mark an upload as complete.
+    
+    Args:
+        s3_key (str): S3 key of the uploaded file
+        file_size (int): Size of the uploaded file in bytes
+        
+    Returns:
+        dict: Success status
+        
+    Raises:
+        HTTPException: If the upload record is not found
+    """
+    try:
+        # Update the upload status in Supabase
+        supabase = get_supabase()
+        
+        result = supabase.table("file_uploads").update({
+            "status": "completed",
+            "file_size": file_size,
+            "uploaded_at": "now()"
+        }).eq("s3_key", s3_key).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Upload record not found")
+        
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error completing upload: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/raster-files/{{project_id}}", response_model=List[Dict[str, Any]])
+async def list_project_raster_files(project_id: str):
+    """List all raster files for a project.
+    
+    Args:
+        project_id: UUID of the project
+        
+    Returns:
+        List[Dict[str, Any]]: List of raster files
+    """
+    try:
+        # Query Supabase for completed file uploads for this project
+        supabase = get_supabase()
+        result = supabase.table("file_uploads").select("*").eq(
+            "project_id", project_id
+        ).eq("status", "completed").order("uploaded_at", desc=True).execute()
+        
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing project raster files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/raster-files/{{raster_file_id}}/metadata", response_model=Dict[str, Any])
+async def get_raster_file_metadata_endpoint(raster_file_id: str):
+    """Get metadata for a raster file.
+    
+    Args:
+        raster_file_id: UUID of the raster file
+        
+    Returns:
+        Dict[str, Any]: Raster file metadata
+    """
+    try:
+        # Get file information from Supabase
+        supabase = get_supabase()
+        result = supabase.table("file_uploads").select("*").eq(
+            "id", raster_file_id
+        ).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Raster file not found")
+        
+        file_data = result.data[0]
+        
+        # Analyze the GeoTIFF to get metadata
+        request = GeoTiffAnalysisRequest(
+            file_path=file_data["s3_key"],
+            org_id=file_data["org_id"],
+            project_id=file_data["project_id"]
+        )
+        
+        metadata = await analyze_geotiff_endpoint(request)
+        
+        # Combine file information with metadata
+        return {
+            "file_info": file_data,
+            "geotiff_metadata": metadata
+        }
+    except Exception as e:
+        logger.error(f"Error getting raster file metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/processed-rasters/{{project_id}}", response_model=List[Dict[str, Any]])
+async def list_project_processed_rasters(project_id: str):
+    """List all processed rasters for a project.
+    
+    Args:
+        project_id: UUID of the project
+        
+    Returns:
+        List[Dict[str, Any]]: List of processed rasters
+    """
+    try:
+        # Query Supabase for completed processing jobs for this project
+        supabase = get_supabase()
+        result = supabase.table("processing_jobs").select("*").eq(
+            "project_id", project_id
+        ).eq("status", "completed").order("completed_at", desc=True).execute()
+        
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing processed rasters: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/processed-rasters/{{processed_raster_id}}/metadata", response_model=Dict[str, Any])
+async def get_processed_raster_metadata_endpoint(processed_raster_id: str):
+    """Get metadata for a processed raster.
+    
+    Args:
+        processed_raster_id: UUID of the processed raster
+        
+    Returns:
+        Dict[str, Any]: Processed raster metadata
+    """
+    try:
+        # Get job information from Supabase
+        supabase = get_supabase()
+        result = supabase.table("processing_jobs").select("*").eq(
+            "id", processed_raster_id
+        ).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Processed raster not found")
+        
+        job_data = result.data[0]
+        
+        # Extract output file path from job result
+        if not job_data.get("result") or not job_data["result"].get("output_path"):
+            raise HTTPException(status_code=404, detail="No output path found in job result")
+        
+        output_path = job_data["result"]["output_path"]
+        
+        # If it's an S3 path, extract the key
+        if output_path.startswith("s3://"):
+            output_path = output_path.split('/', 3)[3]
+        
+        # Analyze the GeoTIFF to get metadata
+        request = GeoTiffAnalysisRequest(
+            file_path=output_path
+        )
+        
+        try:
+            metadata = await analyze_geotiff_endpoint(request)
+        except Exception as e:
+            logger.warning(f"Error analyzing processed raster: {str(e)}")
+            metadata = {"error": str(e)}
+        
+        # Combine job information with metadata
+        return {
+            "job_info": job_data,
+            "geotiff_metadata": metadata
+        }
+    except Exception as e:
+        logger.error(f"Error getting processed raster metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/band-mappings", response_model=List[Dict[str, Any]])
+async def list_band_mappings(project_id: str = None):
+    """List band mappings.
+    
+    Args:
+        project_id: Optional UUID of the project
+        
+    Returns:
+        List[Dict[str, Any]]: List of band mappings
+    """
+    try:
+        # Query Supabase for band mappings
+        supabase = get_supabase()
+        query = supabase.table("band_mappings").select("*")
+        
+        if project_id:
+            # Get mappings for this project or global mappings
+            query = query.or_(f"project_id.eq.{project_id},project_id.is.null")
+        else:
+            # Only get global mappings
+            query = query.is_("project_id", "null")
+        
+        result = query.order("created_at", desc=True).execute()
+        
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing band mappings: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post(f"{settings.API_V1_PREFIX}/band-mappings", response_model=Dict[str, str])
+async def create_band_mapping(
+    name: str,
+    project_id: str,
+    mapping: Dict[str, int],
+    description: str = None
+):
+    """Create a custom band mapping.
+    
+    Args:
+        name: Name of the band mapping
+        mapping: Dictionary mapping band names to band numbers
+        project_id: UUID of the project
+        description: Optional description
+        
+    Returns:
+        Dict[str, str]: Dictionary with the created band mapping ID
+    """
+    try:
+        # Create band mapping in Supabase
+        mapping_id = str(uuid.uuid4())
+        
+        supabase = get_supabase()
+        supabase.table("band_mappings").insert({
+            "id": mapping_id,
+            "name": name,
+            "mapping": mapping,
+            "project_id": project_id,
+            "description": description
+        }).execute()
+        
+        return {"id": mapping_id}
+    except Exception as e:
+        logger.error(f"Error creating band mapping: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=settings.DEBUG)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)

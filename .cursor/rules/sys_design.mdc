@@ -1,0 +1,850 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+I'll outline a comprehensive strategy for integrating your UI service with the backend processing service, focusing on creating a solid foundation that will scale well as your platform grows.
+
+## Integration Strategy for UI and Backend Services
+
+### 1. API-First Approach
+
+Establish clear API contracts between your UI and backend:
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│                 │      │                 │      │                 │
+│   UI Service    │◄────►│    API Layer    │◄────►│ Processing Core │
+│                 │      │                 │      │                 │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+```
+
+#### Implementation Recommendations:
+
+1. **Create an OpenAPI specification**:
+   - Define all endpoints, request/response models, and authentication requirements
+   - Use FastAPI's automatic OpenAPI generation as a starting point
+   - Keep this specification versioned and updated
+
+2. **Versioned API endpoints**:
+   ```
+   /api/v1/projects
+   /api/v1/jobs
+   /api/v1/results
+   ```
+
+3. **Standardized response format**:
+   ```json
+   {
+     "status": "success|error",
+     "data": { ... },
+     "message": "Human-readable message",
+     "metadata": {
+       "pagination": { ... },
+       "processing_info": { ... }
+     }
+   }
+   ```
+
+### 3. File Upload and Processing Flow
+
+Implement a secure, efficient flow for handling file uploads:
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│             │     │             │     │             │     │             │
+│     UI      │────►│   Backend   │────►│     S3      │────►│ Processing  │
+│             │     │             │     │             │     │             │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+     │                                                            │
+     │                       ┌─────────────┐                      │
+     └───────────────────────►  GeoServer  │◄─────────────────────┘
+                             │             │
+                             └─────────────┘
+```
+
+#### Implementation Recommendations:
+
+1. **Direct-to-S3 Upload with Presigned URLs**:
+   ```python
+   @app.post("/api/v1/uploads/request-url")
+   async def get_upload_url(
+       request: UploadRequest,
+       user_data: dict = Depends(validate_token)
+   ):
+       # Verify project access
+       await verify_project_access(request.project_id, user_data)
+       
+       # Generate S3 key based on org/project structure
+       s3_key = f"{request.org_id}/{request.project_id}/raw/{request.filename}"
+       
+       # Generate presigned URL
+       upload_url = await get_presigned_url(s3_key, http_method="PUT")
+       
+       # Log the upload request in Supabase
+       supabase = get_supabase()
+       supabase.table("file_uploads").insert({
+           "user_id": user_data.get("sub"),
+           "project_id": request.project_id,
+           "filename": request.filename,
+           "s3_key": s3_key,
+           "status": "pending"
+       }).execute()
+       
+       return {
+           "status": "success",
+           "data": {
+               "upload_url": upload_url,
+               "s3_key": s3_key
+           }
+       }
+   ```
+
+2. **Process Initiation Endpoint**:
+   ```python
+   @app.post("/api/v1/processing/start")
+   async def start_processing(
+       request: ProcessingRequest,
+       user_data: dict = Depends(validate_token)
+   ):
+       # Verify project access
+       await verify_project_access(request.project_id, user_data)
+       
+       # Prepare job parameters
+       job_id = str(uuid.uuid4())
+       
+       # Store job metadata in Supabase
+       supabase = get_supabase()
+       supabase.table("processing_jobs").insert({
+           "id": job_id,
+           "user_id": user_data.get("sub"),
+           "org_id": request.org_id,
+           "project_id": request.project_id,
+           "input_file": request.s3_key,
+           "process_type": request.process_type,
+           "parameters": request.parameters,
+           "status": "pending"
+       }).execute()
+       
+       # Submit job to processing system
+       await JobManager.submit_job(
+           job_id,
+           processor_map[request.process_type](),
+           {
+               "input_path": request.s3_key,
+               "output_name": f"{request.project_id}_{job_id[:8]}",
+               **request.parameters
+           }
+       )
+       
+       return {
+           "status": "success",
+           "data": {
+               "job_id": job_id
+           }
+       }
+   ```
+
+### 4. GeoServer Integration for Result Visualization
+
+Create a workflow to automatically publish processed results to GeoServer:
+
+```python
+# In a new file: lib/result_publisher.py
+from lib.geoserver_api import create_workspace, publish_geotiff
+from lib.s3_manager import download_file
+import tempfile
+import os
+from pathlib import Path
+
+async def publish_processing_result(
+    job_id: str,
+    s3_key: str,
+    org_id: str,
+    project_id: str,
+    process_type: str
+):
+    """Publish a processing result to GeoServer"""
+    # Create workspace if it doesn't exist
+    workspace = f"org_{org_id}"
+    await create_workspace(workspace)
+    
+    # Layer name based on project and job
+    layer_name = f"project_{project_id}_{process_type}_{job_id[:8]}"
+    
+    # Download file from S3 to temporary location
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+        tmp_path = tmp.name
+    
+    try:
+        await download_file(s3_key, tmp_path)
+        
+        # Publish to GeoServer
+        result = await publish_geotiff(layer_name, tmp_path, workspace)
+        
+        return {
+            "workspace": workspace,
+            "layer": layer_name,
+            "wms_url": f"{settings.GEOSERVER_URL}/wms",
+            "wfs_url": f"{settings.GEOSERVER_URL}/wfs",
+            "preview_url": f"{settings.GEOSERVER_URL}/gwc/demo/{workspace}:{layer_name}?gridSet=EPSG:4326&format=image/png"
+        }
+    finally:
+        # Clean up temporary file
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+```
+
+### 5. Real-time Status Updates with Supabase Realtime
+
+Leverage Supabase's realtime capabilities for job status updates:
+
+#### Backend Implementation:
+```python
+# Update job status in Supabase at key points
+async def update_job_status(job_id: str, status: str, result: dict = None):
+    supabase = get_supabase()
+    update_data = {
+        "status": status,
+        "updated_at": "now()"
+    }
+    
+    if result:
+        update_data["result"] = result
+    
+    supabase.table("processing_jobs").update(
+        update_data
+    ).eq("id", job_id).execute()
+```
+
+#### Frontend Implementation:
+```javascript
+// In your UI service
+const subscribeToJobUpdates = (jobId) => {
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
+  
+  return supabase
+    .from('processing_jobs')
+    .on('UPDATE', payload => {
+      if (payload.new.id === jobId) {
+        // Update UI with new status
+        updateJobStatus(payload.new);
+        
+        // If job is complete, load the visualization
+        if (payload.new.status === 'completed') {
+          loadVisualization(payload.new.result);
+        }
+      }
+    })
+    .subscribe();
+};
+```
+
+### 6. Project Data Structure
+
+Define a clear data structure for organizations, projects, and processing results:
+
+```
+organizations
+├── id
+├── name
+├── created_at
+└── created_by
+
+organization_members
+├── organization_id
+├── user_id
+└── role
+
+projects
+├── id
+├── name
+├── description
+├── organization_id
+├── created_at
+└── created_by
+
+file_uploads
+├── id
+├── project_id
+├── filename
+├── s3_key
+├── file_type
+├── file_size
+├── status
+├── uploaded_at
+└── uploaded_by
+
+processing_jobs
+├── id
+├── project_id
+├── input_file
+├── process_type
+├── parameters
+├── status
+├── result
+├── error_message
+├── created_at
+├── completed_at
+└── created_by
+
+processing_results
+├── id
+├── job_id
+├── project_id
+├── s3_key
+├── geoserver_workspace
+├── geoserver_layer
+├── layer_type
+├── metadata
+├── created_at
+└── created_by
+```
+
+### 7. API Endpoints for the Complete System
+
+Here's a comprehensive list of API endpoints to support the entire UI-Backend integration:
+
+```
+Authentication & Users:
+- POST /api/v1/auth/verify-token (verify JWT from Supabase)
+
+Organizations & Projects:
+- GET /api/v1/organizations (list user's organizations)
+- GET /api/v1/organizations/{org_id}/projects (list projects in an organization)
+- POST /api/v1/organizations/{org_id}/projects (create new project)
+- GET /api/v1/projects/{project_id} (get project details)
+
+File Management:
+- POST /api/v1/uploads/request-url (get presigned upload URL)
+- POST /api/v1/uploads/complete (mark upload as complete)
+- GET /api/v1/projects/{project_id}/files (list files in project)
+
+Processing:
+- POST /api/v1/processing/start (start processing job)
+- GET /api/v1/processing/jobs/{job_id} (get job status)
+- GET /api/v1/projects/{project_id}/jobs (list jobs for project)
+
+Results & Visualization:
+- GET /api/v1/results/{result_id} (get processing result)
+- GET /api/v1/projects/{project_id}/results (list results for project)
+- POST /api/v1/results/{result_id}/publish (publish to GeoServer)
+- GET /api/v1/results/{result_id}/visualization (get visualization config)
+```
+
+### 8. Implementation Plan
+
+#### Phase 1: Core Integration
+1. Implement authentication middleware
+2. Create file upload flow with presigned URLs
+3. Build basic job submission and status endpoints
+4. Set up GeoServer integration for results
+
+#### Phase 2: Enhanced Features
+1. Add real-time status updates with Supabase Realtime
+2. Implement result visualization configurations
+3. Create project management endpoints
+4. Add data export capabilities
+
+#### Phase 3: Advanced Features
+1. Build batch processing capabilities
+2. Implement analysis comparison tools
+3. Add temporal change detection
+4. Create dashboards and reporting
+
+### 9. Handling Cross-Service Failures
+
+Implement robust error handling for cross-service operations:
+
+```python
+# In a new file: utils/transaction.py
+from contextlib import asynccontextmanager
+from typing import List, Callable, Any
+
+class RollbackAction:
+    def __init__(self, action: Callable, *args, **kwargs):
+        self.action = action
+        self.args = args
+        self.kwargs = kwargs
+
+@asynccontextmanager
+async def transaction(*services):
+    """Context manager for cross-service transactions with rollback"""
+    rollback_actions: List[RollbackAction] = []
+    
+    try:
+        # Register rollback action
+        def register_rollback(action: Callable, *args, **kwargs):
+            rollback_actions.append(RollbackAction(action, *args, **kwargs))
+        
+        # Yield control with the rollback registrar
+        yield register_rollback
+    except Exception as e:
+        # Execute rollback actions in reverse order
+        for action in reversed(rollback_actions):
+            try:
+                await action.action(*action.args, **action.kwargs)
+            except Exception as rollback_error:
+                # Log rollback error but continue with other rollbacks
+                logger.error(f"Error during rollback: {rollback_error}")
+        # Re-raise the original exception
+        raise
+```
+
+Usage example:
+```python
+async def start_complex_job(request):
+    async with transaction() as register_rollback:
+        # Create job in Supabase
+        job_result = supabase.table("jobs").insert({...}).execute()
+        job_id = job_result.data[0]["id"]
+        
+        # Register rollback action in case of failure
+        register_rollback(
+            lambda: supabase.table("jobs").delete().eq("id", job_id).execute()
+        )
+        
+        # Upload to S3
+        s3_key = f"jobs/{job_id}/config.json"
+        await upload_file(json.dumps(request), s3_key)
+        
+        # Register rollback
+        register_rollback(delete_s3_file, s3_key)
+        
+        # More operations...
+```
+
+## Implementation Code Examples
+
+### 1. Project Router
+
+```python
+# In a new file: routers/projects.py
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List
+from pydantic import BaseModel
+import uuid
+
+from lib.supabase_client import get_supabase
+from middleware.auth import validate_token, verify_project_access
+
+router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: str = ""
+    organization_id: str
+
+class ProjectResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    organization_id: str
+    created_at: str
+
+@router.get("", response_model=List[ProjectResponse])
+async def list_projects(user_data: dict = Depends(validate_token)):
+    """List all projects accessible to the user"""
+    user_id = user_data.get("sub")
+    supabase = get_supabase()
+    
+    # Get user's organizations
+    org_result = supabase.table("organization_members").select(
+        "organization_id"
+    ).eq("user_id", user_id).execute()
+    
+    if not org_result.data:
+        return []
+    
+    org_ids = [item["organization_id"] for item in org_result.data]
+    
+    # Get projects for these organizations
+    projects_result = supabase.table("projects").select(
+        "*"
+    ).in_("organization_id", org_ids).execute()
+    
+    return projects_result.data
+
+@router.post("", response_model=ProjectResponse)
+async def create_project(
+    project: ProjectCreate,
+    user_data: dict = Depends(validate_token)
+):
+    """Create a new project"""
+    user_id = user_data.get("sub")
+    supabase = get_supabase()
+    
+    # Check if user has access to the organization
+    org_result = supabase.table("organization_members").select(
+        "*"
+    ).eq("organization_id", project.organization_id).eq(
+        "user_id", user_id
+    ).execute()
+    
+    if not org_result.data:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this organization"
+        )
+    
+    # Create project
+    project_id = str(uuid.uuid4())
+    result = supabase.table("projects").insert({
+        "id": project_id,
+        "name": project.name,
+        "description": project.description,
+        "organization_id": project.organization_id,
+        "created_by": user_id
+    }).execute()
+    
+    return result.data[0]
+
+@router.get("/{project_id}", response_model=ProjectResponse)
+async def get_project(
+    project_id: str,
+    user_data: dict = Depends(validate_token)
+):
+    """Get project details"""
+    # Verify project access
+    await verify_project_access(project_id, user_data)
+    
+    # Get project details
+    supabase = get_supabase()
+    result = supabase.table("projects").select("*").eq("id", project_id).execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    return result.data[0]
+```
+
+### 2. File Upload Router
+
+```python
+# In a new file: routers/uploads.py
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+import uuid
+
+from lib.supabase_client import get_supabase
+from lib.s3_manager import get_presigned_url
+from middleware.auth import validate_token, verify_project_access
+
+router = APIRouter(prefix="/api/v1/uploads", tags=["uploads"])
+
+class UploadUrlRequest(BaseModel):
+    project_id: str
+    org_id: str
+    filename: str
+    file_type: str = "geotiff"
+
+class UploadUrlResponse(BaseModel):
+    upload_url: str
+    s3_key: str
+    expires_in: int
+
+@router.post("/request-url", response_model=UploadUrlResponse)
+async def get_upload_url(
+    request: UploadUrlRequest,
+    user_data: dict = Depends(validate_token)
+):
+    """Get a presigned URL for direct S3 upload"""
+    # Verify project access
+    await verify_project_access(request.project_id, user_data)
+    
+    # Generate S3 key based on org/project structure
+    s3_key = f"{request.org_id}/{request.project_id}/raw/{request.filename}"
+    
+    # Generate presigned URL (for PUT operation)
+    upload_url = await get_presigned_url(s3_key, http_method="PUT", expires_in=3600)
+    
+    # Log the upload request in Supabase
+    user_id = user_data.get("sub")
+    supabase = get_supabase()
+    supabase.table("file_uploads").insert({
+        "id": str(uuid.uuid4()),
+        "project_id": request.project_id,
+        "filename": request.filename,
+        "s3_key": s3_key,
+        "file_type": request.file_type,
+        "status": "pending",
+        "uploaded_by": user_id
+    }).execute()
+    
+    return {
+        "upload_url": upload_url,
+        "s3_key": s3_key,
+        "expires_in": 3600
+    }
+
+class UploadCompleteRequest(BaseModel):
+    s3_key: str
+    file_size: int
+
+@router.post("/complete")
+async def complete_upload(
+    request: UploadCompleteRequest,
+    user_data: dict = Depends(validate_token)
+):
+    """Mark an upload as complete"""
+    supabase = get_supabase()
+    
+    # Update the upload status
+    result = supabase.table("file_uploads").update({
+        "status": "completed",
+        "file_size": request.file_size,
+        "uploaded_at": "now()"
+    }).eq("s3_key", request.s3_key).eq(
+        "uploaded_by", user_data.get("sub")
+    ).execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Upload record not found")
+    
+    return {"status": "success"}
+```
+
+### 3. Processing Router
+
+```python
+# In a new file: routers/processing.py
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List
+import uuid
+
+from lib.supabase_client import get_supabase
+from lib.job_manager import JobManager
+from middleware.auth import validate_token, verify_project_access
+from processors.landcover import LandCoverProcessor
+from processors.ndvi import NDVIProcessor
+from processors.orthomosaic import OrthomosaicProcessor
+
+router = APIRouter(prefix="/api/v1/processing", tags=["processing"])
+
+# Map process types to processor classes
+processor_map = {
+    "landcover": LandCoverProcessor,
+    "ndvi": NDVIProcessor,
+    "orthomosaic": OrthomosaicProcessor
+}
+
+class ProcessingRequest(BaseModel):
+    project_id: str
+    org_id: str
+    s3_key: str
+    process_type: str
+    parameters: Dict[str, Any] = {}
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+    result: Dict[str, Any] = None
+    error: str = None
+    start_time: str = None
+    end_time: str = None
+
+@router.post("/start", response_model=Dict[str, str])
+async def start_processing(
+    request: ProcessingRequest,
+    user_data: dict = Depends(validate_token)
+):
+    """Start a new processing job"""
+    # Verify project access
+    await verify_project_access(request.project_id, user_data)
+    
+    # Check process type
+    if request.process_type not in processor_map:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported process type: {request.process_type}"
+        )
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Store job in Supabase
+    user_id = user_data.get("sub")
+    supabase = get_supabase()
+    supabase.table("processing_jobs").insert({
+        "id": job_id,
+        "project_id": request.project_id,
+        "input_file": request.s3_key,
+        "process_type": request.process_type,
+        "parameters": request.parameters,
+        "status": "pending",
+        "created_by": user_id
+    }).execute()
+    
+    # Prepare parameters
+    output_name = f"{request.project_id}_{job_id[:8]}"
+    
+    # Handle different parameter requirements for different processors
+    process_params = {
+        "input_path": request.s3_key,
+        "output_name": output_name
+    }
+    
+    # Add default parameters based on process type
+    if request.process_type == "ndvi" and "red_band" not in request.parameters:
+        process_params["red_band"] = 3
+        process_params["nir_band"] = 4
+    
+    # Add user-specified parameters
+    process_params.update(request.parameters)
+    
+    # Create processor instance
+    processor = processor_map[request.process_type]()
+    
+    # Submit job
+    await JobManager.submit_job(job_id, processor, process_params)
+    
+    return {"job_id": job_id}
+
+@router.get("/jobs/{job_id}", response_model=JobResponse)
+async def get_job_status(
+    job_id: str,
+    user_data: dict = Depends(validate_token)
+):
+    """Get the status of a specific job"""
+    # First check if job exists in the system
+    try:
+        job_status = JobManager.get_job_status(job_id)
+    except KeyError:
+        # Check if it exists in Supabase
+        supabase = get_supabase()
+        result = supabase.table("processing_jobs").select("*").eq("id", job_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        
+        # Return the status from Supabase
+        job = result.data[0]
+        return {
+            "job_id": job["id"],
+            "status": job["status"],
+            "result": job.get("result"),
+            "error": job.get("error_message"),
+            "start_time": job.get("created_at"),
+            "end_time": job.get("completed_at")
+        }
+    
+    return job_status
+
+@router.get("/jobs", response_model=List[JobResponse])
+async def list_jobs(
+    project_id: str = None,
+    user_data: dict = Depends(validate_token)
+):
+    """List all jobs, optionally filtered by project"""
+    user_id = user_data.get("sub")
+    supabase = get_supabase()
+    
+    # Build query
+    query = supabase.table("processing_jobs").select("*").eq("created_by", user_id)
+    
+    if project_id:
+        # Verify project access first
+        await verify_project_access(project_id, user_data)
+        query = query.eq("project_id", project_id)
+    
+    # Execute query
+    result = query.order("created_at", desc=True).execute()
+    
+    # Map to response format
+    jobs = []
+    for job in result.data:
+        jobs.append({
+            "job_id": job["id"],
+            "status": job["status"],
+            "result": job.get("result"),
+            "error": job.get("error_message"),
+            "start_time": job.get("created_at"),
+            "end_time": job.get("completed_at")
+        })
+    
+    return jobs
+```
+
+## Integrating with app.py
+
+Finally, tie everything together in your main app.py file:
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
+
+from config import get_settings
+from lib.supabase_client import init_supabase
+from lib.s3_manager import init_s3_client
+from lib.geoserver_api import init_geoserver_client
+from lib.job_manager import JobManager
+from utils.logging import setup_logging
+from routers import projects, uploads, processing
+
+settings = get_settings()
+
+# Initialize logging
+setup_logging()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Initializing services...")
+    init_supabase()
+    init_s3_client()
+    init_geoserver_client()
+    JobManager.initialize(max_workers=settings.MAX_WORKERS)
+    yield
+    # Shutdown
+    logger.info("Shutting down services...")
+    await JobManager.shutdown()
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
+    docs_url=f"{settings.API_V1_PREFIX}/docs",
+    lifespan=lifespan
+)
+
+# CORS middleware configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "version": settings.PROJECT_NAME}
+
+# Include routers
+app.include_router(projects.router)
+app.include_router(uploads.router)
+app.include_router(processing.router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)
+```
+
+## Summary
+
+This integration strategy provides:
+
+1. **Clear API boundaries** between UI and backend services
+2. **Secure authentication** using Supabase JWT tokens
+3. **Efficient file handling** with direct-to-S3 uploads
+4. **Real-time updates** for processing status
+5. **Consistent data structure** across UI and backend
+6. **Scalable design** that can grow with your platform
+7. **Comprehensive endpoints** for all required functionality
+
+By implementing this foundation, you'll be well-positioned for future growth, whether you maintain a monolithic approach or transition to microservices. The clear API contracts will make either path viable without significant rework.

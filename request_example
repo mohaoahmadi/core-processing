@@ -1,0 +1,22 @@
+curl -X POST http://localhost:8000/api/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "process_type": "health_indices",
+    "input_file": "LZW_cog.tif",
+    "org_id": "test-org",
+    "project_id": "test-project",
+    "parameters": {
+      "indices": ["NDVI", "NDRE", "EVI", "SAVI", "NDWI", "CNDVI"],
+      "sensor_type": "WV3",
+      "band_mapping": {
+        "C": 1,
+        "B": 2,
+        "G": 3,
+        "Y": 4,
+        "R": 5,
+        "Re": 6,
+        "N": 7,
+        "SWIR1": 8
+      }
+    }
+  }'
