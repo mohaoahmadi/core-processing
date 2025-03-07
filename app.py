@@ -88,8 +88,8 @@ class ProcessingJobRequest(BaseModel):
             - "orthomosaic": Orthomosaic generation
             - "health_indices": Multiple vegetation and health indices
         input_file (str): Path or identifier of the input file
-        org_id (str): Organization identifier
-        project_id (str): Project identifier
+        org_id (uuid.UUID): Organization identifier
+        project_id (uuid.UUID): Project identifier
         parameters (Dict[str, Any]): Additional processing parameters:
             - For landcover: classification thresholds
             - For NDVI: band indices
@@ -98,9 +98,14 @@ class ProcessingJobRequest(BaseModel):
     """
     process_type: str
     input_file: str
-    org_id: str
-    project_id: str
+    org_id: uuid.UUID
+    project_id: uuid.UUID
     parameters: Dict[str, Any] = {}
+    
+    class Config:
+        json_encoders = {
+            uuid.UUID: lambda v: str(v)
+        }
 
 class JobStatusResponse(BaseModel):
     """Response model for job status information.
@@ -253,16 +258,28 @@ async def create_job(
         try:
             supabase = get_supabase()
             
+            # Get organization name
+            org_result = supabase.table("organizations").select("name").eq("id", job_request.org_id).execute()
+            if not org_result.data:
+                raise HTTPException(status_code=404, detail=f"Organization with ID {job_request.org_id} not found")
+            org_name = org_result.data[0]["name"]
+
+            # Get project name
+            project_result = supabase.table("projects").select("name").eq("id", job_request.project_id).execute()
+            if not project_result.data:
+                raise HTTPException(status_code=404, detail=f"Project with ID {job_request.project_id} not found")
+            project_name = project_result.data[0]["name"]
+            
             # Create a proper insert that maps to your table structure
             # Store project_id as string instead of trying to convert to UUID
             supabase.table("processing_jobs").insert({
-                "id": job_id,  # This should be UUID format already
-                "project_id": job_request.project_id,  # Store as string
+                "id": job_id,
+                "project_id": job_request.project_id,
+                "organization_id": job_request.org_id,
                 "input_file": job_request.input_file,
                 "process_type": job_request.process_type,
                 "parameters": job_request.parameters,
-                "status": "pending",
-                "org_id": job_request.org_id  # Make sure your table has this column
+                "status": "pending"
             }).execute()
             
             logger.info(f"Job record created in Supabase")
@@ -321,7 +338,7 @@ async def get_job_status(job_id: str):
                 job_id=job["id"],
                 status=job["status"],
                 result=job.get("result"),
-                error=job.get("error_message"),
+                error=job.get("error"),
                 start_time=job.get("created_at"),
                 end_time=job.get("completed_at")
             )
@@ -369,7 +386,7 @@ async def list_jobs(project_id: str = None):
                 job_id=job["id"],
                 status=job["status"],
                 result=job.get("result"),
-                error=job.get("error_message"),
+                error=job.get("error"),
                 start_time=job.get("created_at"),
                 end_time=job.get("completed_at")
             ))
@@ -973,6 +990,10 @@ async def create_band_mapping(
     except Exception as e:
         logger.error(f"Error creating band mapping: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+def construct_s3_path(org_id: uuid.UUID, project_id: uuid.UUID, filename: str) -> str:
+    """Construct an S3 path using organization and project IDs."""
+    return f"{org_id}/{project_id}/{filename}"
 
 if __name__ == "__main__":
     import uvicorn

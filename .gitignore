@@ -11,6 +11,8 @@ __pycache__/
 *.tif.ovr.ovr.aux.xml
 *.tif.ovr.ovr.ovr.aux.xml
 
+.cursor/
+
 # C extensions
 *.so
 
