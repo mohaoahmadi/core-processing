@@ -821,74 +821,75 @@ async def complete_upload(request: Request):
         
         logger.info(f"Completing upload for S3 key: {s3_key}, size: {file_size}")
         
+        # Extract file information from s3_key
+        parts = s3_key.split('/')
+        if len(parts) >= 4:  # Expecting format: org_id/project_id/raw/filename
+            org_id = parts[0]
+            project_id = parts[1]
+            filename = parts[-1]
+        else:
+            logger.error(f"Invalid S3 key format: {s3_key}")
+            raise HTTPException(status_code=400, detail="Invalid S3 key format")
+        
         # Update the upload status in Supabase
         supabase = get_supabase()
         
         try:
-            # First, try updating with file_size
-            try:
-                result = supabase.table("file_uploads").update({
-                    "status": "completed",
-                    "file_size": file_size,
-                    "updated_at": "now()"
-                }).eq("s3_key", s3_key).execute()
-            except Exception as column_error:
-                # If file_size column doesn't exist, try without it
-                if "Could not find the 'file_size' column" in str(column_error):
-                    logger.warning("file_size column not found in file_uploads table. Updating without it.")
-                    result = supabase.table("file_uploads").update({
-                        "status": "completed",
-                        "updated_at": "now()"
-                    }).eq("s3_key", s3_key).execute()
-                else:
-                    raise column_error
+            # First, check if there's an existing record (including deleted ones)
+            existing_result = supabase.table("raster_files").select("*").eq(
+                "project_id", project_id
+            ).eq("file_name", filename).execute()
             
-            if not result.data:
-                logger.warning(f"No upload record found for S3 key: {s3_key}")
-                # Create a new record if it doesn't exist
-                parts = s3_key.split('/')
-                if len(parts) >= 3:
-                    org_id = parts[0]
-                    project_id = parts[1]
-                    filename = parts[-1]
-                    
-                    try:
-                        # Try inserting with file_size
-                        supabase.table("file_uploads").insert({
-                            "id": str(uuid.uuid4()),
-                            "filename": filename,
-                            "s3_key": s3_key,
-                            "org_id": org_id,
-                            "project_id": project_id,
-                            "content_type": "image/tiff",
-                            "status": "completed",
-                            "file_size": file_size
-                        }).execute()
-                    except Exception as insert_error:
-                        # If file_size column doesn't exist, try without it
-                        if "Could not find the 'file_size' column" in str(insert_error):
-                            logger.warning("file_size column not found in file_uploads table. Inserting without it.")
-                            supabase.table("file_uploads").insert({
-                                "id": str(uuid.uuid4()),
-                                "filename": filename,
-                                "s3_key": s3_key,
-                                "org_id": org_id,
-                                "project_id": project_id,
-                                "content_type": "image/tiff",
-                                "status": "completed"
-                            }).execute()
-                        else:
-                            raise insert_error
-                    
-                    logger.info(f"Created new upload record for S3 key: {s3_key}")
-                else:
-                    logger.error(f"Invalid S3 key format: {s3_key}")
-                    raise HTTPException(status_code=400, detail="Invalid S3 key format")
+            if existing_result.data:
+                # Found existing record(s), update the most recent one
+                existing_file = sorted(
+                    existing_result.data,
+                    key=lambda x: x.get("created_at", ""),
+                    reverse=True
+                )[0]
+                
+                # Update the existing record
+                update_data = {
+                    "s3_url": f"s3://{s3_key}",
+                    "file_size": file_size,
+                    "deleted": False,
+                    "deleted_at": None
+                }
+                
+                result = supabase.table("raster_files").update(
+                    update_data
+                ).eq("id", existing_file["id"]).execute()
+                
+                logger.info(f"Updated existing raster file record: {existing_file['id']}")
+            else:
+                # No existing record, create new one
+                new_record = {
+                    "id": str(uuid.uuid4()),
+                    "project_id": project_id,
+                    "file_name": filename,
+                    "s3_url": f"s3://{s3_key}",
+                    "file_size": file_size,
+                    "deleted": False,
+                    "width": 0,
+                    "height": 0,
+                    "band_count": 0,
+                    "driver": "GTiff",
+                    "bounds": {
+                        "minx": 0,
+                        "miny": 0,
+                        "maxx": 0,
+                        "maxy": 0
+                    },
+                    "metadata": {}
+                }
+                
+                result = supabase.table("raster_files").insert(new_record).execute()
+                logger.info(f"Created new raster file record")
+            
         except Exception as db_error:
             logger.error(f"Database error: {str(db_error)}")
-            # Check if the table doesn't exist
-            if "relation \"public.file_uploads\" does not exist" in str(db_error):
-                logger.warning("The file_uploads table does not exist. Skipping record update.")
+            if "relation \"public.raster_files\" does not exist" in str(db_error):
+                logger.warning("The raster_files table does not exist. Skipping record update.")
             else:
                 raise db_error
         
