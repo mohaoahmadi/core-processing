@@ -22,7 +22,7 @@ Architecture:
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import uuid
@@ -30,6 +30,7 @@ import os
 import sys
 from typing import List, Dict, Any
 from pydantic import BaseModel
+import datetime
 
 # Initialize GDAL before importing other modules
 try:
@@ -71,6 +72,7 @@ from processors.orthomosaic import OrthomosaicProcessor
 from processors.health_indices import HealthIndicesProcessor, HEALTH_INDICES
 from utils.logging import setup_logging
 from utils.geo_utils import analyze_geotiff
+from utils.supabase_raster_manager import get_project_raster_files
 
 settings = get_settings()
 
@@ -733,38 +735,74 @@ async def get_upload_url(request: PresignedUrlRequest):
     try:
         # Generate S3 key
         s3_key = f"{request.org_id}/{request.project_id}/raw/{request.filename}"
+        logger.info(f"Generated S3 key: {s3_key}")
         
         # Generate presigned URL for PUT operation
         presigned_url = await get_presigned_url(s3_key, http_method="PUT", expires_in=3600)
         
-        # Record the upload request in Supabase
-        supabase = get_supabase()
-        supabase.table("file_uploads").insert({
-            "id": str(uuid.uuid4()),
-            "filename": request.filename,
-            "s3_key": s3_key,
-            "org_id": request.org_id,
-            "project_id": request.project_id,
-            "content_type": request.content_type,
-            "status": "pending"
-        }).execute()
+        # Try to record the upload request in Supabase
+        try:
+            supabase = get_supabase()
+            
+            # Check if the file_uploads table exists
+            try:
+                supabase.table("file_uploads").select("id").limit(1).execute()
+                
+                # If we get here, the table exists, so insert the record
+                supabase.table("file_uploads").insert({
+                    "id": str(uuid.uuid4()),
+                    "filename": request.filename,
+                    "s3_key": s3_key,
+                    "org_id": request.org_id,
+                    "project_id": request.project_id,
+                    "content_type": request.content_type,
+                    "status": "pending"
+                }).execute()
+                
+            except Exception as table_error:
+                # If the table doesn't exist, log a warning but continue
+                if "relation \"public.file_uploads\" does not exist" in str(table_error):
+                    logger.warning("The file_uploads table does not exist. Skipping record insertion.")
+                    logger.warning("Please create the file_uploads table with the following schema:")
+                    logger.warning("""
+                    CREATE TABLE public.file_uploads (
+                        id UUID PRIMARY KEY,
+                        filename TEXT NOT NULL,
+                        s3_key TEXT NOT NULL,
+                        org_id UUID NOT NULL,
+                        project_id UUID NOT NULL,
+                        content_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        FOREIGN KEY (org_id) REFERENCES organizations(id),
+                        FOREIGN KEY (project_id) REFERENCES projects(id)
+                    );
+                    """)
+                else:
+                    # If it's a different error, re-raise it
+                    raise table_error
+                
+        except Exception as db_error:
+            # Log the database error but continue with URL generation
+            logger.error(f"Error recording upload in database: {str(db_error)}")
+            logger.warning("Continuing with URL generation despite database error")
         
         return {
             "upload_url": presigned_url,
             "s3_key": s3_key,
-            "expires_in": 3600
+            "expires_in": str(3600)  # Convert to string to match response_model
         }
     except Exception as e:
         logger.error(f"Error generating presigned URL: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post(f"{settings.API_V1_PREFIX}/uploads/complete")
-async def complete_upload(s3_key: str, file_size: int = 0):
+async def complete_upload(request: Request):
     """Mark an upload as complete.
     
     Args:
-        s3_key (str): S3 key of the uploaded file
-        file_size (int): Size of the uploaded file in bytes
+        request (Request): Request object containing s3_key and file_size
         
     Returns:
         dict: Success status
@@ -773,19 +811,90 @@ async def complete_upload(s3_key: str, file_size: int = 0):
         HTTPException: If the upload record is not found
     """
     try:
+        # Parse request body
+        body = await request.json()
+        s3_key = body.get("s3_key")
+        file_size = body.get("file_size", 0)
+        
+        if not s3_key:
+            raise HTTPException(status_code=422, detail="s3_key is required")
+        
+        logger.info(f"Completing upload for S3 key: {s3_key}, size: {file_size}")
+        
         # Update the upload status in Supabase
         supabase = get_supabase()
         
-        result = supabase.table("file_uploads").update({
-            "status": "completed",
-            "file_size": file_size,
-            "uploaded_at": "now()"
-        }).eq("s3_key", s3_key).execute()
-        
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Upload record not found")
+        try:
+            # First, try updating with file_size
+            try:
+                result = supabase.table("file_uploads").update({
+                    "status": "completed",
+                    "file_size": file_size,
+                    "updated_at": "now()"
+                }).eq("s3_key", s3_key).execute()
+            except Exception as column_error:
+                # If file_size column doesn't exist, try without it
+                if "Could not find the 'file_size' column" in str(column_error):
+                    logger.warning("file_size column not found in file_uploads table. Updating without it.")
+                    result = supabase.table("file_uploads").update({
+                        "status": "completed",
+                        "updated_at": "now()"
+                    }).eq("s3_key", s3_key).execute()
+                else:
+                    raise column_error
+            
+            if not result.data:
+                logger.warning(f"No upload record found for S3 key: {s3_key}")
+                # Create a new record if it doesn't exist
+                parts = s3_key.split('/')
+                if len(parts) >= 3:
+                    org_id = parts[0]
+                    project_id = parts[1]
+                    filename = parts[-1]
+                    
+                    try:
+                        # Try inserting with file_size
+                        supabase.table("file_uploads").insert({
+                            "id": str(uuid.uuid4()),
+                            "filename": filename,
+                            "s3_key": s3_key,
+                            "org_id": org_id,
+                            "project_id": project_id,
+                            "content_type": "image/tiff",
+                            "status": "completed",
+                            "file_size": file_size
+                        }).execute()
+                    except Exception as insert_error:
+                        # If file_size column doesn't exist, try without it
+                        if "Could not find the 'file_size' column" in str(insert_error):
+                            logger.warning("file_size column not found in file_uploads table. Inserting without it.")
+                            supabase.table("file_uploads").insert({
+                                "id": str(uuid.uuid4()),
+                                "filename": filename,
+                                "s3_key": s3_key,
+                                "org_id": org_id,
+                                "project_id": project_id,
+                                "content_type": "image/tiff",
+                                "status": "completed"
+                            }).execute()
+                        else:
+                            raise insert_error
+                    
+                    logger.info(f"Created new upload record for S3 key: {s3_key}")
+                else:
+                    logger.error(f"Invalid S3 key format: {s3_key}")
+                    raise HTTPException(status_code=400, detail="Invalid S3 key format")
+        except Exception as db_error:
+            logger.error(f"Database error: {str(db_error)}")
+            # Check if the table doesn't exist
+            if "relation \"public.file_uploads\" does not exist" in str(db_error):
+                logger.warning("The file_uploads table does not exist. Skipping record update.")
+            else:
+                raise db_error
         
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error completing upload: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -801,19 +910,20 @@ async def list_project_raster_files(project_id: str):
         List[Dict[str, Any]]: List of raster files
     """
     try:
-        # Query Supabase for completed file uploads for this project
-        supabase = get_supabase()
-        result = supabase.table("file_uploads").select("*").eq(
-            "project_id", project_id
-        ).eq("status", "completed").order("uploaded_at", desc=True).execute()
+        # Import the utility function from supabase_raster_manager
+        from utils.supabase_raster_manager import get_project_raster_files
         
-        return result.data
+        # Use the dedicated function to get raster files
+        raster_files = await get_project_raster_files(project_id)
+        
+        logger.info(f"Retrieved {len(raster_files)} raster files for project {project_id}")
+        return raster_files
     except Exception as e:
         logger.error(f"Error listing project raster files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get(f"{settings.API_V1_PREFIX}/raster-files/{{raster_file_id}}/metadata", response_model=Dict[str, Any])
-async def get_raster_file_metadata_endpoint(raster_file_id: str):
+async def get_raster_file_metadata(raster_file_id: str):
     """Get metadata for a raster file.
     
     Args:
@@ -823,31 +933,20 @@ async def get_raster_file_metadata_endpoint(raster_file_id: str):
         Dict[str, Any]: Raster file metadata
     """
     try:
-        # Get file information from Supabase
-        supabase = get_supabase()
-        result = supabase.table("file_uploads").select("*").eq(
-            "id", raster_file_id
-        ).execute()
+        # Import the utility function from supabase_raster_manager
+        from utils.supabase_raster_manager import get_raster_file_metadata
         
-        if not result.data:
+        # Use the dedicated function to get raster file metadata
+        raster_file = await get_raster_file_metadata(raster_file_id)
+        
+        if not raster_file:
+            logger.warning(f"Raster file not found: {raster_file_id}")
             raise HTTPException(status_code=404, detail="Raster file not found")
         
-        file_data = result.data[0]
-        
-        # Analyze the GeoTIFF to get metadata
-        request = GeoTiffAnalysisRequest(
-            file_path=file_data["s3_key"],
-            org_id=file_data["org_id"],
-            project_id=file_data["project_id"]
-        )
-        
-        metadata = await analyze_geotiff_endpoint(request)
-        
-        # Combine file information with metadata
-        return {
-            "file_info": file_data,
-            "geotiff_metadata": metadata
-        }
+        logger.info(f"Retrieved metadata for raster file: {raster_file_id}")
+        return raster_file
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting raster file metadata: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -994,6 +1093,135 @@ async def create_band_mapping(
 def construct_s3_path(org_id: uuid.UUID, project_id: uuid.UUID, filename: str) -> str:
     """Construct an S3 path using organization and project IDs."""
     return f"{org_id}/{project_id}/{filename}"
+
+@app.get(f"{settings.API_V1_PREFIX}/organizations", response_model=List[Dict[str, Any]])
+async def list_organizations():
+    """List all organizations for the current user.
+    
+    Returns:
+        List[Dict[str, Any]]: List of organizations
+        
+    Note:
+        This endpoint retrieves all organizations from the database.
+        In a production environment, this should be filtered by the authenticated user.
+    """
+    try:
+        # Query Supabase for organizations
+        supabase = get_supabase()
+        result = supabase.table("organizations").select("*").execute()
+        
+        logger.info(f"Retrieved {len(result.data)} organizations")
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing organizations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/organizations/{{org_id}}/projects", response_model=List[Dict[str, Any]])
+async def list_organization_projects(org_id: str):
+    """List all projects for a specific organization.
+    
+    Args:
+        org_id (str): Organization ID
+        
+    Returns:
+        List[Dict[str, Any]]: List of projects
+        
+    Raises:
+        HTTPException: If the organization is not found
+    """
+    try:
+        # Verify organization exists
+        supabase = get_supabase()
+        org_result = supabase.table("organizations").select("*").eq("id", org_id).execute()
+        
+        if not org_result.data:
+            logger.warning(f"Organization not found: {org_id}")
+            raise HTTPException(status_code=404, detail=f"Organization with ID {org_id} not found")
+        
+        # Try to use service role client
+        from lib.supabase_client import get_supabase_service_client
+        service_client = get_supabase_service_client()
+        
+        if service_client:
+            # Query projects using service role client
+            logger.info(f"Querying projects for organization {org_id} using service role client")
+            project_result = service_client.table("projects").select("*").eq("organization_id", org_id).execute()
+            
+            if project_result.data:
+                logger.info(f"Found {len(project_result.data)} projects for organization {org_id}")
+                return project_result.data
+            else:
+                logger.info(f"No projects found for organization {org_id}")
+                return []
+        else:
+            # Fallback to regular client if service client is not available
+            logger.warning("Service role client not available, using regular client")
+            project_result = supabase.table("projects").select("*").eq("organization_id", org_id).execute()
+            
+            if project_result.data:
+                logger.info(f"Found {len(project_result.data)} projects for organization {org_id}")
+                return project_result.data
+            else:
+                logger.info(f"No projects found for organization {org_id}")
+                return []
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing organization projects: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete(f"{settings.API_V1_PREFIX}/raster-files/{{raster_file_id}}")
+async def delete_raster_file(raster_file_id: str):
+    """Delete a raster file.
+    
+    Args:
+        raster_file_id: UUID of the raster file
+        
+    Returns:
+        Dict[str, str]: Success message
+        
+    Raises:
+        HTTPException: If the file is not found or cannot be deleted
+    """
+    try:
+        supabase = get_supabase()
+        
+        # Get file information
+        result = supabase.table("raster_files").select("*").eq("id", raster_file_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Raster file not found")
+        
+        file_data = result.data[0]
+        s3_url = file_data.get("s3_url")
+        
+        # Delete from S3 if URL exists
+        if s3_url:
+            from lib.s3_manager import delete_file
+            try:
+                bucket_name = "mirzamspectrum"
+                s3_key = s3_url[5:] if s3_url.startswith("s3://") else s3_url
+                
+                deletion_success = await delete_file(s3_key, bucket_name)
+                if not deletion_success:
+                    logger.warning(f"Could not delete file from S3, proceeding with database update anyway")
+            except Exception as s3_error:
+                logger.error(f"Error in S3 deletion attempt: {str(s3_error)}")
+        
+        # Update database using new columns
+        update_result = supabase.table("raster_files").update({
+            "deleted": True,
+            "deleted_at": datetime.datetime.now().isoformat()
+        }).eq("id", raster_file_id).execute()
+        
+        return {"status": "success", "message": "Raster file marked as deleted"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting raster file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Supabase Configuration
     SUPABASE_URL: Optional[str] = None
     SUPABASE_KEY: Optional[str] = None
-    
+    SUPABASE_SERVICE_KEY: Optional[str] = None
     # AWS S3 Configuration
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None

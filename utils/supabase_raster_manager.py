@@ -289,31 +289,31 @@ async def create_custom_band_mapping(
         return None
 
 async def get_project_raster_files(project_id: str) -> List[Dict[str, Any]]:
-    """
-    Get all raster files for a project.
+    """Get all non-deleted raster files for a project.
     
     Args:
         project_id: UUID of the project
         
     Returns:
-        List of raster files
+        List[Dict[str, Any]]: List of active raster files
     """
     try:
-        # Get the singleton Supabase client
         supabase = get_supabase()
         
-        # Query the raster_files table
-        response = supabase.table('raster_files').select('*').eq('project_id', project_id).execute()
+        # Query raster files for this project using the new deleted column
+        query = (supabase.table("raster_files")
+                .select("*")
+                .eq("project_id", project_id)
+                .eq("deleted", False))  # Use the new column
         
-        if hasattr(response, 'error') and response.error:
-            logger.error(f"Error getting project raster files: {response.error}")
-            return []
-            
-        return response.data
+        result = query.execute()
+        
+        logger.info(f"Retrieved {len(result.data)} active raster files for project {project_id}")
+        return result.data
         
     except Exception as e:
-        logger.error(f"Failed to get project raster files: {str(e)}")
-        return []
+        logger.error(f"Error getting project raster files: {str(e)}")
+        raise Exception(f"Error getting project raster files: {str(e)}")
 
 async def get_project_processed_rasters(project_id: str) -> List[Dict[str, Any]]:
     """

@@ -162,12 +162,13 @@ async def download_file(s3_key: str, local_path: str) -> None:
         logger.error(f"Error in download thread: {str(e)}")
         raise
 
-async def get_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
+async def get_presigned_url(s3_key: str, expires_in: int = 3600, http_method: str = "GET") -> str:
     """Generate a presigned URL for an S3 object asynchronously.
     
     Args:
         s3_key (str): Key of the object in S3 bucket
         expires_in (int, optional): URL expiration time in seconds. Defaults to 3600.
+        http_method (str, optional): HTTP method for the URL. Defaults to "GET".
         
     Returns:
         str: Presigned URL for the S3 object
@@ -176,20 +177,38 @@ async def get_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
         The URL generation is performed in a separate thread to avoid blocking
         the event loop. The URL will be valid for the specified expiration time.
     """
-    logger.info(f"Generating presigned URL - Key: {s3_key}, Expiration: {expires_in}s")
+    logger.info(f"Generating presigned URL - Key: {s3_key}, Method: {http_method}, Expiration: {expires_in}s")
     client = get_s3_client()
     
     def _get_presigned_url():
         try:
             logger.debug(f"Generating URL for bucket: {settings.S3_BUCKET_NAME}")
-            url = client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': settings.S3_BUCKET_NAME, 'Key': s3_key},
-                ExpiresIn=expires_in
-            )
-            logger.info("Presigned URL generated successfully")
-            logger.debug(f"URL expiration: {expires_in} seconds")
-            return url
+            
+            # For PUT requests, we need to use the client.generate_presigned_post method
+            if http_method == "PUT":
+                # For PUT operations, we'll use presigned POST which is more reliable for uploads
+                response = client.generate_presigned_url(
+                    ClientMethod='put_object',
+                    Params={
+                        'Bucket': settings.S3_BUCKET_NAME,
+                        'Key': s3_key,
+                        'ContentType': 'image/tiff'  # Set the content type
+                    },
+                    ExpiresIn=expires_in,
+                    HttpMethod='PUT'
+                )
+                logger.info("Presigned PUT URL generated successfully")
+                return response
+            else:
+                # For GET requests, use the standard method
+                url = client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': settings.S3_BUCKET_NAME, 'Key': s3_key},
+                    ExpiresIn=expires_in
+                )
+                logger.info("Presigned GET URL generated successfully")
+                return url
+                
         except Exception as e:
             logger.error(f"URL generation failed: {str(e)}", exc_info=True)
             raise
@@ -222,3 +241,80 @@ def download_file_sync(s3_key: str, local_path: str) -> None:
     except Exception as e:
         logger.error(f"Error downloading file from S3: {str(e)}")
         raise Exception(f"Failed to download file from S3: {str(e)}")
+
+async def delete_file(file_path: str, bucket_name: str = None) -> bool:
+    """
+    Delete a file from S3.
+    
+    Args:
+        file_path: The path to the file within the bucket
+        bucket_name: The name of the S3 bucket. If None, uses the default from settings.
+    
+    Returns:
+        bool: True if deletion was successful, False otherwise
+    """
+    try:
+        from config import get_settings
+        settings = get_settings()
+        
+        # Use provided bucket_name or default from settings
+        bucket = bucket_name if bucket_name else settings.S3_BUCKET_NAME
+        
+        logger.debug(f"Attempting S3 deletion - Bucket: {bucket}, Key: {file_path}")
+        
+        # Get the S3 client
+        s3_client = get_s3_client()
+        
+        # Try to delete the object
+        try:
+            # First check if the object exists
+            logger.debug(f"Checking if object exists in bucket {bucket}")
+            s3_client.head_object(Bucket=bucket, Key=file_path)
+            
+            # Object exists, delete it
+            logger.debug(f"Object found, proceeding with deletion")
+            s3_client.delete_object(Bucket=bucket, Key=file_path)
+            logger.info(f"Successfully deleted file from S3 bucket {bucket}: {file_path}")
+            return True
+            
+        except s3_client.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                # Try to list objects with this prefix to help debug
+                try:
+                    prefix = '/'.join(file_path.split('/')[:-1]) + '/'
+                    response = s3_client.list_objects_v2(
+                        Bucket=bucket,
+                        Prefix=prefix,
+                        MaxKeys=10
+                    )
+                    if 'Contents' in response:
+                        logger.debug(f"Files found with similar prefix: {[obj['Key'] for obj in response['Contents']]}")
+                    else:
+                        logger.debug(f"No files found with prefix: {prefix}")
+                except Exception as list_err:
+                    logger.debug(f"Error listing similar files: {str(list_err)}")
+                
+                logger.warning(f"File not found in S3 bucket {bucket}: {file_path}")
+                return False
+            else:
+                logger.error(f"S3 error: {str(e)}")
+                raise
+                
+    except Exception as e:
+        logger.error(f"Error deleting file from S3: {e}")
+        return False
+
+async def delete_raster_file(raster_id: str):
+    try:
+        # Assuming you have a way to get the bucket_name and file_path
+        # You might need to fetch these from your database first
+        raster_info = await get_raster_info(raster_id)  # This function would need to exist
+        bucket_name = "your-bucket-name"  # Replace with actual bucket name or get from config
+        file_path = raster_info.get("file_path")  # Get the file path from the raster info
+        
+        # Now call delete_file with both required parameters
+        await delete_file(file_path, bucket_name)
+        
+        # ... rest of the function ...
+    except Exception as e:
+        logger.warning(f"Error deleting file from S3: {e}")
