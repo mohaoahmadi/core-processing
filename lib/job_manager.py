@@ -12,6 +12,9 @@ from datetime import datetime
 import asyncio
 from loguru import logger
 from dataclasses import dataclass, field
+import httpx
+from config import Settings as settings
+import json
 
 @dataclass
 class ProcessingResult:
@@ -20,6 +23,16 @@ class ProcessingResult:
     message: str
     output_path: Optional[str]
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Ensure metadata is JSON serializable."""
+        # If metadata contains non-serializable objects, convert them to strings
+        if self.metadata:
+            for key, value in list(self.metadata.items()):
+                try:
+                    json.dumps({key: value})
+                except (TypeError, OverflowError):
+                    self.metadata[key] = str(value)
 
 class JobStatus(Enum):
     """Enumeration of possible job states.
@@ -173,6 +186,60 @@ class JobManager:
                 
                 job.status = JobStatus.COMPLETED
                 logger.info(f"Job {job_id} completed successfully")
+                
+                # Update the job result in the database first
+                try:
+                    from lib.supabase_client import get_supabase
+                    supabase = get_supabase()
+                    
+                    # Format the result for database storage
+                    result_data = {}
+                    if isinstance(job.result, ProcessingResult):
+                        # Ensure metadata is JSON serializable
+                        metadata = {}
+                        try:
+                            # Test if metadata is JSON serializable
+                            if job.result.metadata:
+                                json.dumps(job.result.metadata)
+                                metadata = job.result.metadata
+                        except TypeError:
+                            # If not serializable, convert to string representation
+                            logger.warning(f"Metadata is not JSON serializable, converting to string")
+                            metadata = str(job.result.metadata)
+                        
+                        result_data = {
+                            "status": job.result.status,
+                            "message": job.result.message,
+                            "output_path": job.result.output_path,
+                            "metadata": metadata
+                        }
+                    
+                    # Update the job record with the result
+                    update_result = supabase.table("processing_jobs").update({
+                        "status": "completed",
+                        "result": result_data,
+                        "completed_at": datetime.utcnow().isoformat()
+                    }).eq("id", job_id).execute()
+                    
+                    if update_result.data:
+                        logger.info(f"Successfully updated job result in database for job {job_id}")
+                    else:
+                        logger.warning(f"Failed to update job result in database for job {job_id}")
+                except Exception as e:
+                    logger.error(f"Error updating job result in database: {str(e)}")
+                
+                # Call the complete_job endpoint to update the database
+                try:
+                    async with httpx.AsyncClient() as client:
+                        complete_url = f"http://localhost:8000/api/v1/jobs/{job_id}/complete"
+                        logger.info(f"Calling complete_job endpoint: {complete_url}")
+                        response = await client.post(complete_url)
+                        if response.status_code == 200:
+                            logger.info(f"Successfully called complete_job endpoint for job {job_id}")
+                        else:
+                            logger.error(f"Failed to call complete_job endpoint for job {job_id}: {response.status_code} {response.text}")
+                except Exception as e:
+                    logger.error(f"Error calling complete_job endpoint: {str(e)}")
                 
             except Exception as e:
                 job.status = JobStatus.FAILED

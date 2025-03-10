@@ -18,6 +18,8 @@ from processors.base import BaseProcessor, ProcessingResult
 from lib.s3_manager import upload_file, download_file
 from utils.geo_utils import normalize_array
 from config import get_settings
+from supabase import create_client
+from lib.supabase_client import get_supabase
 
 # Setup QGIS environment variables and paths
 QGIS_AVAILABLE = False
@@ -111,153 +113,33 @@ except ImportError as e:
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Define the dictionary of index algorithms with formulas and metadata
-HEALTH_INDICES = {
-    'NDVI': {
-        'expr': '(N - R) / (N + R)',
-        'help': 'Normalized Difference Vegetation Index shows the amount of green vegetation.',
-        'range': (-1, 1),
-        'bands': ['N', 'R']
-    },
-    'NDYI': {
-        'expr': '(G - B) / (G + B)',
-        'help': 'Normalized difference yellowness index (NDYI), best model variability in relative yield potential in Canola.',
-        'range': (-1, 1),
-        'bands': ['G', 'B']
-    },
-    'NDRE': {
-        'expr': '(N - Re) / (N + Re)',
-        'help': 'Normalized Difference Red Edge Index shows the amount of green vegetation of permanent or later stage crops.',
-        'range': (-1, 1),
-        'bands': ['N', 'Re']
-    },
-    'NDWI': {
-        'expr': '(G - N) / (G + N)',
-        'help': 'Normalized Difference Water Index shows the amount of water content in water bodies.',
-        'range': (-1, 1),
-        'bands': ['G', 'N']
-    },
-    'NDVI_Blue': {
-        'expr': '(N - B) / (N + B)',
-        'help': 'Normalized Difference Vegetation Index using blue band shows the amount of green vegetation.',
-        'range': (-1, 1),
-        'bands': ['N', 'B']
-    },
-    'CNDVI': {
-        'expr': '(N - C) / (N + C)',
-        'help': 'Coastal Normalized Difference Vegetation Index uses the coastal band instead of red, useful for shallow water vegetation mapping.',
-        'range': (-1, 1),
-        'bands': ['N', 'C']
-    },
-    'ENDVI': {
-        'expr': '((N + G) - (2 * B)) / ((N + G) + (2 * B))',
-        'help': 'Enhanced Normalized Difference Vegetation Index is like NDVI, but uses Blue and Green bands instead of only Red to isolate plant health.',
-        'range': (-1, 1),
-        'bands': ['N', 'G', 'B']
-    },
-    'vNDVI': {
-        'expr': '0.5268 * ((R ^ -0.1294) * (G ^ 0.3389) * (B ^ -0.3118))',
-        'help': 'Visible NDVI is an un-normalized index for RGB sensors using constants derived from citrus, grape, and sugarcane crop data.',
-        'range': (0, 1),
-        'bands': ['R', 'G', 'B']
-    },
-    'VARI': {
-        'expr': '(G - R) / (G + R - B)',
-        'help': 'Visual Atmospheric Resistance Index shows the areas of vegetation.',
-        'range': (-1, 1),
-        'bands': ['G', 'R', 'B']
-    },
-    'MPRI': {
-        'expr': '(G - R) / (G + R)',
-        'help': 'Modified Photochemical Reflectance Index',
-        'range': (-1, 1),
-        'bands': ['G', 'R']
-    },
-    'EXG': {
-        'expr': '(2 * G) - (R + B)',
-        'help': 'Excess Green Index (derived from only the RGB bands) emphasizes the greenness of leafy crops such as potatoes.',
-        'range': (-2, 2),
-        'bands': ['G', 'R', 'B']
-    },
-    'BAI': {
-        'expr': '1.0 / (((0.1 - R) ^ 2) + ((0.06 - N) ^ 2))',
-        'help': 'Burn Area Index highlights burned land in the red to near-infrared spectrum.',
-        'range': (0, 100),
-        'bands': ['R', 'N']
-    },
-    'GLI': {
-        'expr': '((2 * G) - R - B) / ((2 * G) + R + B)',
-        'help': 'Green Leaf Index shows green leaves and stems.',
-        'range': (-1, 1),
-        'bands': ['G', 'R', 'B']
-    },
-    'GNDVI': {
-        'expr': '(N - G) / (N + G)',
-        'help': 'Green Normalized Difference Vegetation Index is similar to NDVI, but measures the green spectrum instead of red.',
-        'range': (-1, 1),
-        'bands': ['N', 'G']
-    },
-    'GRVI': {
-        'expr': 'N / G',
-        'help': 'Green Ratio Vegetation Index is sensitive to photosynthetic rates in forests.',
-        'range': (0, 10),
-        'bands': ['N', 'G']
-    },
-    'SAVI': {
-        'expr': '(1.5 * (N - R)) / (N + R + 0.5)',
-        'help': 'Soil Adjusted Vegetation Index is similar to NDVI but attempts to remove the effects of soil areas using an adjustment factor (0.5).',
-        'range': (-1, 1.5),
-        'bands': ['N', 'R']
-    },
-    'MNLI': {
-        'expr': '((N ^ 2 - R) * 1.5) / (N ^ 2 + R + 0.5)',
-        'help': 'Modified Non-Linear Index improves the Non-Linear Index algorithm to account for soil areas.',
-        'range': (-1, 1.5),
-        'bands': ['N', 'R']
-    },
-    'MSR': {
-        'expr': '((N / R) - 1) / (sqrt(N / R) + 1)',
-        'help': 'Modified Simple Ratio is an improvement of the Simple Ratio (SR) index to be more sensitive to vegetation.',
-        'range': (-1, 1),
-        'bands': ['N', 'R']
-    },
-    'RDVI': {
-        'expr': '(N - R) / sqrt(N + R)',
-        'help': 'Renormalized Difference Vegetation Index uses the difference between near-IR and red, plus NDVI to show areas of healthy vegetation.',
-        'range': (-1, 1),
-        'bands': ['N', 'R']
-    },
-    'TDVI': {
-        'expr': '1.5 * ((N - R) / sqrt((N ^ 2) + R + 0.5))',
-        'help': 'Transformed Difference Vegetation Index highlights vegetation cover in urban environments.',
-        'range': (-1, 1.5),
-        'bands': ['N', 'R']
-    },
-    'OSAVI': {
-        'expr': '(N - R) / (N + R + 0.16)',
-        'help': 'Optimized Soil Adjusted Vegetation Index is based on SAVI, but tends to work better in areas with little vegetation where soil is visible.',
-        'range': (-1, 1),
-        'bands': ['N', 'R']
-    },
-    'LAI': {
-        'expr': '3.618 * (2.5 * (N - R) / (N + 6 * R - 7.5 * B + 1)) * 0.118',
-        'help': 'Leaf Area Index estimates foliage areas and predicts crop yields.',
-        'range': (0, 10),
-        'bands': ['N', 'R', 'B']
-    },
-    'EVI': {
-        'expr': '2.5 * (N - R) / (N + 6 * R - 7.5 * B + 1)',
-        'help': 'Enhanced Vegetation Index is useful in areas where NDVI might saturate, by using blue wavelengths to correct soil signals.',
-        'range': (-1, 1),
-        'bands': ['N', 'R', 'B']
-    },
-    'ARVI': {
-        'expr': '(N - (2 * R) + B) / (N + (2 * R) + B)',
-        'help': 'Atmospherically Resistant Vegetation Index. Useful when working with imagery for regions with high atmospheric aerosol content.',
-        'range': (-1, 1),
-        'bands': ['N', 'R', 'B']
-    }
-}
+async def load_health_indices() -> Dict[str, Dict[str, Any]]:
+    """Load health indices from Supabase table.
+    
+    Returns:
+        Dict[str, Dict[str, Any]]: Dictionary of health indices with their metadata
+    """
+    try:
+        supabase = get_supabase()
+        result = supabase.table("health_indices").select("*").execute()
+        
+        if not result.data:
+            logger.error("No health indices found in database")
+            return {}
+            
+        indices = {}
+        for row in result.data:
+            indices[row['name']] = {
+                'expr': row['formula'],
+                'help': row['description'],
+                'range': (row['min_value'], row['max_value']),
+                'bands': row['required_bands']
+            }
+            
+        return indices
+    except Exception as e:
+        logger.error(f"Error loading health indices from database: {str(e)}")
+        return {}
 
 # Default band mapping for common satellite sensors
 DEFAULT_BAND_MAPPINGS = {
@@ -351,6 +233,12 @@ class HealthIndicesProcessor(BaseProcessor):
             logger.error("Missing required parameter: input_path")
             return False
             
+        # Load available indices
+        health_indices = await load_health_indices()
+        if not health_indices:
+            logger.error("No health indices available in database")
+            return False
+            
         # Validate indices if provided
         if "indices" in kwargs:
             indices = kwargs["indices"]
@@ -360,7 +248,7 @@ class HealthIndicesProcessor(BaseProcessor):
                 
             # Check if all requested indices are supported
             for index in indices:
-                if index not in HEALTH_INDICES:
+                if index not in health_indices:
                     logger.error(f"Unsupported index: {index}")
                     return False
         
@@ -380,11 +268,11 @@ class HealthIndicesProcessor(BaseProcessor):
                 
             # Check if all required bands are in the mapping
             required_bands = set()
-            indices_to_process = kwargs.get("indices", list(HEALTH_INDICES.keys()))
+            indices_to_process = kwargs.get("indices", list(health_indices.keys()))
             
             for index in indices_to_process:
-                if index in HEALTH_INDICES:
-                    required_bands.update(HEALTH_INDICES[index]["bands"])
+                if index in health_indices:
+                    required_bands.update(health_indices[index]["bands"])
             
             for band in required_bands:
                 if band not in band_mapping:
@@ -421,10 +309,18 @@ class HealthIndicesProcessor(BaseProcessor):
             
         logger.info("Starting health indices calculation process")
         
+        # Load health indices from database
+        health_indices = await load_health_indices()
+        if not health_indices:
+            return ProcessingResult(
+                status="error",
+                message="No health indices available in database"
+            )
+        
         # Extract parameters
         input_path: str = kwargs["input_path"]
         output_dir_name: str = kwargs.get("output_dir", "health_indices")
-        indices_to_process: List[str] = kwargs.get("indices", list(HEALTH_INDICES.keys()))
+        indices_to_process: List[str] = kwargs.get("indices", list(health_indices.keys()))
         sensor_type: str = kwargs.get("sensor_type", "WV3")
         custom_band_mapping: Dict[str, int] = kwargs.get("band_mapping", {})
         scale_output: bool = kwargs.get("scale_output", True)
@@ -583,11 +479,11 @@ class HealthIndicesProcessor(BaseProcessor):
             # Process each requested index
             results = {}
             for index_name in indices_to_process:
-                if index_name not in HEALTH_INDICES:
+                if index_name not in health_indices:
                     logger.warning(f"Skipping unsupported index: {index_name}")
                     continue
                 
-                index_info = HEALTH_INDICES[index_name]
+                index_info = health_indices[index_name]
                 expr = index_info["expr"]
                 
                 # Check if all required bands are available
@@ -778,10 +674,10 @@ class HealthIndicesProcessor(BaseProcessor):
                 
                 # Construct the S3 key with the health_indices subfolder
                 if effective_org_id and effective_project_id:
-                    s3_key = f"{effective_org_id}/{effective_project_id}/health_indices/{output_filename}"
+                    s3_key = f"{effective_org_id}/{effective_project_id}/processed/health_indices/{index_name}.tif"
                     logger.info(f"Saving to organization/project structure: {s3_key}")
                 else:
-                    s3_key = f"{output_dir_name}/{output_filename}"
+                    s3_key = f"processed/health_indices/{index_name}.tif"
                     logger.info(f"Saving to default location: {s3_key}")
                 
                 s3_path = await upload_file(output_path, s3_key)

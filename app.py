@@ -2,7 +2,7 @@
 
 This module implements the main FastAPI application for the Core Processing API.
 It provides RESTful endpoints for:
-- Geospatial image processing (NDVI, land cover, orthomosaic, health indices)
+- Geospatial image processing (health indices, land cover, orthomosaic, terrain analysis)
 - Job management and status tracking
 - GeoServer integration for processed results
 
@@ -28,9 +28,10 @@ from loguru import logger
 import uuid
 import os
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import datetime
+from enum import Enum
 
 # Initialize GDAL before importing other modules
 try:
@@ -67,9 +68,9 @@ from lib.s3_manager import init_s3_client, get_presigned_url
 from lib.geoserver_api import init_geoserver_client, publish_geotiff
 from lib.job_manager import JobManager
 from processors.landcover import LandCoverProcessor
-from processors.ndvi import NDVIProcessor
 from processors.orthomosaic import OrthomosaicProcessor
-from processors.health_indices import HealthIndicesProcessor, HEALTH_INDICES
+from processors.health_indices import HealthIndicesProcessor
+from processors.terrain import TerrainAnalysisProcessor
 from utils.logging import setup_logging
 from utils.geo_utils import analyze_geotiff
 from utils.supabase_raster_manager import get_project_raster_files
@@ -79,26 +80,36 @@ settings = get_settings()
 # Initialize logging
 setup_logging()
 
+class ProcessType(str, Enum):
+    """Enumeration of available processing types."""
+    ORTHOMOSAIC = "orthomosaic"
+    HEALTH_INDICES = "health_indices"
+    CLASSIFICATION = "classification"
+    LAND_COVER = "land_cover"
+    TERRAIN = "terrain_analysis"
+
 # Define request/response models
 class ProcessingJobRequest(BaseModel):
     """Request model for creating a new processing job.
     
     Attributes:
-        process_type (str): Type of processing to perform:
-            - "landcover": Land cover classification
-            - "ndvi": Normalized Difference Vegetation Index
+        process_type (ProcessType): Type of processing to perform:
             - "orthomosaic": Orthomosaic generation
             - "health_indices": Multiple vegetation and health indices
+            - "classification": Image classification
+            - "land_cover": Land cover analysis
+            - "terrain_analysis": Terrain analysis and DEM processing
         input_file (str): Path or identifier of the input file
         org_id (uuid.UUID): Organization identifier
         project_id (uuid.UUID): Project identifier
         parameters (Dict[str, Any]): Additional processing parameters:
-            - For landcover: classification thresholds
-            - For NDVI: band indices
             - For orthomosaic: blending method
             - For health_indices: indices list, sensor type, band mapping
+            - For classification: model parameters
+            - For land_cover: classification thresholds
+            - For terrain_analysis: analysis types, parameters
     """
-    process_type: str
+    process_type: ProcessType
     input_file: str
     org_id: uuid.UUID
     project_id: uuid.UUID
@@ -106,8 +117,16 @@ class ProcessingJobRequest(BaseModel):
     
     class Config:
         json_encoders = {
-            uuid.UUID: lambda v: str(v)
+            uuid.UUID: lambda v: str(v),
+            ProcessType: lambda v: v.value  # Ensure ProcessType is serialized as its string value
         }
+        use_enum_values = True  # This ensures the enum is handled as its value in JSON
+
+class ProcessTypeInfo(BaseModel):
+    """Information about a processing type."""
+    name: str
+    description: str
+    parameters: Dict[str, Any]
 
 class JobStatusResponse(BaseModel):
     """Response model for job status information.
@@ -163,6 +182,16 @@ class PresignedUrlRequest(BaseModel):
     project_id: str
     content_type: str = "image/tiff"
 
+class CreateJobResponse(BaseModel):
+    """Response model for job creation.
+    
+    Attributes:
+        job_id (str): Unique identifier for the created job
+        processed_raster_id (Optional[str]): ID of the processed raster record, if created
+    """
+    job_id: str
+    processed_raster_id: Optional[str] = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events.
@@ -213,7 +242,7 @@ async def health_check():
     return {"status": "healthy", "version": settings.PROJECT_NAME}
 
 # Processing endpoints
-@app.post(f"{settings.API_V1_PREFIX}/jobs", response_model=Dict[str, str])
+@app.post(f"{settings.API_V1_PREFIX}/jobs", response_model=CreateJobResponse)
 async def create_job(
     job_request: ProcessingJobRequest,
     background_tasks: BackgroundTasks
@@ -226,77 +255,139 @@ async def create_job(
         job_id = str(uuid.uuid4())
         logger.debug(f"Generated job ID: {job_id}")
         
-        # Select processor
+        # Select processor based on process type
         processor_map = {
-            "landcover": LandCoverProcessor(),
-            "ndvi": NDVIProcessor(),
             "orthomosaic": OrthomosaicProcessor(),
-            "health_indices": HealthIndicesProcessor()
+            "health_indices": HealthIndicesProcessor(),
+            "land_cover": LandCoverProcessor(),
+            "classification": LandCoverProcessor(),  # Using LandCover for now
+            "terrain_analysis": TerrainAnalysisProcessor()
         }
         
-        if job_request.process_type not in processor_map:
-            logger.error(f"Invalid process type requested: {job_request.process_type}")
-            raise HTTPException(status_code=400, detail=f"Unsupported process type: {job_request.process_type}")
+        process_type_str = job_request.process_type if isinstance(job_request.process_type, str) else job_request.process_type.value
         
-        processor = processor_map[job_request.process_type]
+        if process_type_str not in processor_map:
+            logger.error(f"Invalid process type requested: {process_type_str}")
+            raise HTTPException(status_code=400, detail=f"Unsupported process type: {process_type_str}")
+        
+        processor = processor_map[process_type_str]
         logger.debug(f"Selected processor: {processor.__class__.__name__}")
         
-        # Prepare parameters
-        s3_key = f"{job_request.org_id}/{job_request.project_id}/{job_request.input_file}"
-        output_name = f"{job_request.project_id}_{job_request.process_type}_{job_id[:8]}"
+        # Get input file information from raster_files table
+        supabase = get_supabase()
+        input_file_result = supabase.table("raster_files").select("*").eq(
+            "project_id", str(job_request.project_id)  # Convert UUID to string
+        ).eq("file_name", job_request.input_file).eq("type", "raw").execute()
         
-        logger.debug(f"Prepared S3 key: {s3_key}")
-        logger.debug(f"Prepared output name: {output_name}")
+        if not input_file_result.data:
+            raise HTTPException(status_code=404, detail=f"Input file {job_request.input_file} not found")
         
+        input_file = input_file_result.data[0]
+        
+        # Prepare S3 paths
+        input_s3_key = input_file["s3_url"].replace("s3://", "") if input_file["s3_url"].startswith("s3://") else input_file["s3_url"]
+        
+        # For health indices, we'll create a base path since each index gets its own file
+        if process_type_str == "health_indices":
+            output_base_path = f"{str(job_request.org_id)}/{str(job_request.project_id)}/processed/health_indices"
+            # We don't need output_name or output_s3_key for health indices as each index creates its own file
+        else:
+            output_name = f"{job_request.project_id}_{process_type_str}_{job_id[:8]}.tif"
+            output_s3_key = f"{str(job_request.org_id)}/{str(job_request.project_id)}/processed/{process_type_str}/{output_name}"
+        
+        logger.debug(f"Input S3 key: {input_s3_key}")
+        
+        try:
+            # Create initial processed_rasters record only for non-health-indices jobs
+            if process_type_str != "health_indices":
+                processed_raster_id = str(uuid.uuid4())
+                processed_raster_record = {
+                    "id": processed_raster_id,
+                    "processing_job_id": None,  # Will update this after job creation
+                    "raster_file_id": str(input_file["id"]),  # Convert UUID to string
+                    "output_type": process_type_str,  # Use string version consistently
+                    "s3_url": f"s3://mirzamspectrum/{output_s3_key}",
+                    "width": 0,  # Will be updated after processing
+                    "height": 0,
+                    "band_count": 0,
+                    "driver": "GTiff",
+                    "bounds": {
+                        "minx": 0,
+                        "miny": 0,
+                        "maxx": 0,
+                        "maxy": 0
+                    },
+                    "metadata": {}
+                }
+                
+                # Insert the processed raster record
+                raster_result = supabase.table("processed_rasters").insert(processed_raster_record).execute()
+                if not raster_result.data:
+                    raise Exception("Failed to create processed raster record")
+                logger.info(f"Created processed_rasters record: {processed_raster_id}")
+            else:
+                processed_raster_id = None  # For health indices, we'll create records when the job completes
+            
+            # Then create the job record
+            job_record = {
+                "id": job_id,
+                "project_id": str(job_request.project_id),  # Convert UUID to string
+                "organization_id": str(job_request.org_id),  # Convert UUID to string
+                "input_file": job_request.input_file,
+                "input_raster_id": str(input_file["id"]),  # Convert UUID to string
+                "process_type": process_type_str,  # Use string version consistently
+                "parameters": job_request.parameters,
+                "status": "pending",
+                "processed_raster_id": processed_raster_id,  # Will be None for health indices
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            
+            # Insert job record
+            job_result = supabase.table("processing_jobs").insert(job_record).execute()
+            if not job_result.data:
+                raise Exception("Failed to create processing job record")
+            logger.info(f"Created processing job record: {job_id}")
+            
+            # Update the processed raster with the job ID (only for non-health-indices)
+            if processed_raster_id:
+                update_result = supabase.table("processed_rasters").update({
+                    "processing_job_id": job_id
+                }).eq("id", processed_raster_id).execute()
+                if not update_result.data:
+                    logger.warning(f"Failed to update processed raster with job ID")
+            
+        except Exception as db_error:
+            # Try to clean up any created records in case of error
+            try:
+                if processed_raster_id and 'raster_result' in locals():
+                    supabase.table("processed_rasters").delete().eq("id", processed_raster_id).execute()
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup: {str(cleanup_error)}")
+            
+            logger.error(f"Database error: {str(db_error)}")
+            raise HTTPException(status_code=500, detail=f"Failed to create database records: {str(db_error)}")
+        
+        # Prepare parameters for the processor
         params = {
-            "input_path": s3_key,
-            "output_name": output_name,
+            "input_path": input_s3_key,
+            "output_base_path": output_base_path if process_type_str == "health_indices" else None,
+            "output_name": output_name if process_type_str != "health_indices" else None,
+            "output_path": output_s3_key if process_type_str != "health_indices" else None,
+            "job_id": job_id,
             **job_request.parameters
         }
         
         logger.debug(f"Final processing parameters: {params}")
-        
-        # Record the job in Supabase - using the string fields directly, not as UUIDs
-        try:
-            supabase = get_supabase()
-            
-            # Get organization name
-            org_result = supabase.table("organizations").select("name").eq("id", job_request.org_id).execute()
-            if not org_result.data:
-                raise HTTPException(status_code=404, detail=f"Organization with ID {job_request.org_id} not found")
-            org_name = org_result.data[0]["name"]
-
-            # Get project name
-            project_result = supabase.table("projects").select("name").eq("id", job_request.project_id).execute()
-            if not project_result.data:
-                raise HTTPException(status_code=404, detail=f"Project with ID {job_request.project_id} not found")
-            project_name = project_result.data[0]["name"]
-            
-            # Create a proper insert that maps to your table structure
-            # Store project_id as string instead of trying to convert to UUID
-            supabase.table("processing_jobs").insert({
-                "id": job_id,
-                "project_id": job_request.project_id,
-                "organization_id": job_request.org_id,
-                "input_file": job_request.input_file,
-                "process_type": job_request.process_type,
-                "parameters": job_request.parameters,
-                "status": "pending"
-            }).execute()
-            
-            logger.info(f"Job record created in Supabase")
-        except Exception as db_error:
-            # Log the database error but continue with job processing
-            logger.error(f"Error recording job in database: {str(db_error)}")
-            # Continue processing anyway since the job manager doesn't require db record
         
         # Submit job
         logger.info(f"Submitting job {job_id} to JobManager")
         await JobManager.submit_job(job_id, processor, params)
         
         logger.info(f"Job {job_id} submitted successfully")
-        return {"job_id": job_id}
+        return CreateJobResponse(job_id=job_id, processed_raster_id=processed_raster_id)
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating job: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -486,8 +577,25 @@ async def list_health_indices():
     logger.info("Listing available health indices")
     
     try:
-        # Return the health indices dictionary with metadata
-        return HEALTH_INDICES
+        # Query health indices from database
+        supabase = get_supabase()
+        result = supabase.table("health_indices").select("*").execute()
+        
+        if not result.data:
+            logger.warning("No health indices found in database")
+            return {}
+            
+        # Convert to the expected format
+        indices = {}
+        for row in result.data:
+            indices[row['name']] = {
+                'expr': row['formula'],
+                'help': row['description'],
+                'range': (row['min_value'], row['max_value']),
+                'bands': row['required_bands']
+            }
+            
+        return indices
     except Exception as e:
         logger.error(f"Error listing health indices: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error listing health indices: {str(e)}")
@@ -901,26 +1009,57 @@ async def complete_upload(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get(f"{settings.API_V1_PREFIX}/raster-files/{{project_id}}", response_model=List[Dict[str, Any]])
-async def list_project_raster_files(project_id: str):
-    """List all raster files for a project.
+async def list_project_raster_files(project_id: str, folder: str = None):
+    """List raster files for a project, optionally filtered by folder.
     
     Args:
         project_id: UUID of the project
+        folder: Optional folder filter ('raw' or 'processed')
         
     Returns:
         List[Dict[str, Any]]: List of raster files
     """
     try:
-        # Import the utility function from supabase_raster_manager
-        from utils.supabase_raster_manager import get_project_raster_files
+        supabase = get_supabase()
+        query = supabase.table("raster_files").select("*").eq("project_id", project_id).eq("deleted", False)
         
-        # Use the dedicated function to get raster files
-        raster_files = await get_project_raster_files(project_id)
+        if folder == 'raw':
+            query = query.eq("type", "raw")
+        elif folder == 'processed':
+            query = query.eq("type", "processed")
+            
+        result = query.order("created_at", desc=True).execute()
         
-        logger.info(f"Retrieved {len(raster_files)} raster files for project {project_id}")
-        return raster_files
+        return result.data
     except Exception as e:
         logger.error(f"Error listing project raster files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/raster-files/{{project_id}}/processed/{{raw_file_id}}", response_model=List[Dict[str, Any]])
+async def list_processed_files_for_raw(project_id: str, raw_file_id: str):
+    """List processed files derived from a specific raw file.
+    
+    Args:
+        project_id: UUID of the project
+        raw_file_id: UUID of the parent raw file
+        
+    Returns:
+        List[Dict[str, Any]]: List of processed raster files
+    """
+    try:
+        supabase = get_supabase()
+        result = supabase.table("raster_files") \
+            .select("*") \
+            .eq("project_id", project_id) \
+            .eq("parent_id", raw_file_id) \
+            .eq("type", "processed") \
+            .eq("deleted", False) \
+            .order("created_at", desc=True) \
+            .execute()
+            
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing processed files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get(f"{settings.API_V1_PREFIX}/raster-files/{{raster_file_id}}/metadata", response_model=Dict[str, Any])
@@ -1223,6 +1362,245 @@ async def delete_raster_file(raster_file_id: str):
     except Exception as e:
         logger.error(f"Error deleting raster file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post(f"{settings.API_V1_PREFIX}/jobs/{{job_id}}/complete", response_model=Dict[str, Any])
+async def complete_job(job_id: str):
+    """Mark a job as completed and record processed files."""
+    try:
+        # Get job information from Supabase
+        supabase = get_supabase()
+        job_result = supabase.table("processing_jobs").select("*").eq("id", job_id).execute()
+        
+        if not job_result.data:
+            logger.error(f"Job not found: {job_id}")
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job_data = job_result.data[0]
+        process_type = job_data.get("process_type")
+        input_raster_id = job_data.get("input_raster_id")
+        
+        logger.info(f"Completing job {job_id} of type {process_type}")
+        logger.debug(f"Job data: {job_data}")
+        
+        # Extract result data
+        if not job_data.get("result"):
+            logger.warning(f"No result data found for job {job_id}")
+            return {"status": "completed", "message": "Job marked as completed, but no results found"}
+        
+        # For health indices, handle multiple output files
+        if process_type == "health_indices":
+            # Find indices results in different possible locations
+            indices_results = None
+            result_data = job_data["result"]
+            
+            # Check different possible paths for indices results
+            if isinstance(result_data, dict):
+                if "metadata" in result_data and "indices" in result_data["metadata"]:
+                    indices_results = result_data["metadata"]["indices"]
+                elif "indices" in result_data:
+                    indices_results = result_data["indices"]
+                elif "results" in result_data:
+                    indices_results = result_data["results"]
+                # Try to parse from raw_result if it exists
+                elif "metadata" in result_data and "raw_result" in result_data["metadata"]:
+                    try:
+                        import ast
+                        raw_result = result_data["metadata"]["raw_result"]
+                        # Convert string representation to dict
+                        if isinstance(raw_result, str):
+                            metadata_str = raw_result.split("metadata=")[1]
+                            metadata_dict = ast.literal_eval(metadata_str)
+                            if "indices" in metadata_dict:
+                                indices_results = metadata_dict["indices"]
+                    except Exception as e:
+                        logger.error(f"Error parsing raw_result: {str(e)}")
+            
+            if not indices_results:
+                logger.warning("No indices results found in job output")
+                return {"status": "completed", "message": "No indices results found"}
+            
+            logger.info(f"Found indices results: {list(indices_results.keys())}")
+            
+            # Track the first processed raster ID to update the job
+            first_processed_raster_id = None
+            
+            # Process each index
+            for index_name, index_data in indices_results.items():
+                try:
+                    # Extract or construct the output path
+                    output_path = None
+                    if isinstance(index_data, dict):
+                        output_path = index_data.get("output_path")
+                    
+                    # If no output path found, construct it
+                    if not output_path:
+                        org_id = job_data.get("organization_id")
+                        project_id = job_data.get("project_id")
+                        output_path = f"{org_id}/{project_id}/processed/health_indices/{index_name}.tif"
+                    
+                    # Ensure the path starts with s3://mirzamspectrum/
+                    if not output_path.startswith("s3://"):
+                        output_path = f"s3://mirzamspectrum/{output_path}"
+                    
+                    # Create processed raster record
+                    processed_raster_id = str(uuid.uuid4())
+                    
+                    # Store the first processed raster ID
+                    if first_processed_raster_id is None:
+                        first_processed_raster_id = processed_raster_id
+                    
+                    processed_raster = {
+                        "id": processed_raster_id,
+                        "processing_job_id": job_id,
+                        "raster_file_id": input_raster_id,
+                        "output_type": index_name,  # Use specific index name
+                        "s3_url": output_path,
+                        "width": index_data.get("width", 0),
+                        "height": index_data.get("height", 0),
+                        "band_count": 1,  # Health indices are single-band
+                        "driver": "GTiff",
+                        "bounds": {
+                            "minx": index_data.get("bounds", {}).get("minx", 0),
+                            "miny": index_data.get("bounds", {}).get("miny", 0),
+                            "maxx": index_data.get("bounds", {}).get("maxx", 0),
+                            "maxy": index_data.get("bounds", {}).get("maxy", 0)
+                        },
+                        "metadata": {
+                            "index_name": index_name,
+                            "formula": index_data.get("formula"),
+                            "description": index_data.get("description"),
+                            "value_range": index_data.get("value_range"),
+                            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "status": "completed"
+                        }
+                    }
+                    
+                    # Insert the record
+                    insert_result = supabase.table("processed_rasters").insert(processed_raster).execute()
+                    if not insert_result.data:
+                        logger.error(f"Failed to create processed raster record for {index_name}")
+                    else:
+                        logger.info(f"Created processed raster record for {index_name}: {processed_raster_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing index {index_name}: {str(e)}")
+                    continue
+            
+            # Update the job with the first processed raster ID
+            if first_processed_raster_id:
+                logger.info(f"Updating job with processed_raster_id: {first_processed_raster_id}")
+                update_data = {
+                    "status": "completed",
+                    "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "processed_raster_id": first_processed_raster_id
+                }
+            else:
+                update_data = {
+                    "status": "completed",
+                    "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                }
+        else:
+            # For non-health-indices jobs
+            update_data = {
+                "status": "completed",
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+        
+        # Update job status
+        job_update = supabase.table("processing_jobs").update(update_data).eq("id", job_id).execute()
+        if not job_update.data:
+            logger.warning(f"Failed to update job status")
+        else:
+            logger.info(f"Successfully updated job with status and processed_raster_id")
+        
+        return {"status": "completed", "message": "Job completed successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error completing job: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.API_V1_PREFIX}/process-types", response_model=Dict[str, ProcessTypeInfo])
+async def list_process_types():
+    """List all available processing types with descriptions and required parameters.
+    
+    Returns:
+        Dict[str, ProcessTypeInfo]: Dictionary of process types with their metadata
+    """
+    logger.info("Listing available process types")
+    
+    return {
+        ProcessType.ORTHOMOSAIC: ProcessTypeInfo(
+            name="Orthomosaic Generation",
+            description="Generate orthomosaic from overlapping images",
+            parameters={
+                "blending_method": {
+                    "type": "string",
+                    "description": "Method used for blending overlapping images",
+                    "options": ["average", "mosaic", "max", "min"]
+                }
+            }
+        ),
+        ProcessType.HEALTH_INDICES: ProcessTypeInfo(
+            name="Health Indices",
+            description="Calculate various vegetation and health indices",
+            parameters={
+                "indices": {
+                    "type": "array",
+                    "description": "List of indices to calculate"
+                },
+                "sensor_type": {
+                    "type": "string",
+                    "description": "Type of sensor/satellite"
+                },
+                "band_mapping": {
+                    "type": "object",
+                    "description": "Custom band number mapping"
+                }
+            }
+        ),
+        ProcessType.CLASSIFICATION: ProcessTypeInfo(
+            name="Image Classification",
+            description="Perform image classification using machine learning",
+            parameters={
+                "model": {
+                    "type": "string",
+                    "description": "Classification model to use"
+                },
+                "classes": {
+                    "type": "array",
+                    "description": "List of classes to identify"
+                }
+            }
+        ),
+        ProcessType.LAND_COVER: ProcessTypeInfo(
+            name="Land Cover Analysis",
+            description="Analyze and classify land cover types",
+            parameters={
+                "classification_type": {
+                    "type": "string",
+                    "description": "Type of land cover classification"
+                },
+                "thresholds": {
+                    "type": "object",
+                    "description": "Classification thresholds"
+                }
+            }
+        ),
+        ProcessType.TERRAIN: ProcessTypeInfo(
+            name="Terrain Analysis",
+            description="Analyze terrain features and generate DEM products",
+            parameters={
+                "analysis_types": {
+                    "type": "array",
+                    "description": "Types of terrain analysis to perform"
+                },
+                "resolution": {
+                    "type": "number",
+                    "description": "Output resolution in meters"
+                }
+            }
+        )
+    }
 
 if __name__ == "__main__":
     import uvicorn
