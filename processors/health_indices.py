@@ -366,40 +366,42 @@ class HealthIndicesProcessor(BaseProcessor):
         
         # Check the input raster and verify band mapping
         try:
-            # Try using GDAL first to check the raster
-            try:
-                from osgeo import gdal
-                ds = gdal.Open(local_input_path)
-                if ds is None:
-                    logger.error(f"Failed to open raster with GDAL: {local_input_path}")
-                    return ProcessingResult(
-                        status="error",
-                        message=f"Failed to open raster with GDAL: {local_input_path}"
-                    )
-                
-                # Get band count
-                band_count = ds.RasterCount
-                logger.info(f"Input raster has {band_count} bands")
-                
-                # Check if band mapping is valid
-                invalid_bands = []
-                for band_name, band_number in band_mapping.items():
-                    if band_number < 1 or band_number > band_count:
-                        invalid_bands.append((band_name, band_number))
-                
-                if invalid_bands:
-                    error_msg = f"Invalid band mapping: {invalid_bands}. Raster has {band_count} bands."
-                    logger.error(error_msg)
-                    return ProcessingResult(
-                        status="error",
-                        message=error_msg
-                    )
-                
-                # Close the dataset
-                ds = None
-            except ImportError:
-                logger.warning("GDAL not available for raster checking")
-        
+            # Initialize GDAL drivers first
+            from osgeo import gdal
+            gdal.AllRegister()  # Make sure all drivers are registered
+            
+            # Try using GDAL to check the raster
+            ds = gdal.Open(local_input_path)
+            if ds is None:
+                error_msg = gdal.GetLastErrorMsg() or "Unknown error"
+                logger.error(f"Failed to open raster with GDAL: {local_input_path}. Error: {error_msg}")
+                return ProcessingResult(
+                    status="error",
+                    message=f"Failed to open raster with GDAL: {local_input_path}. Error: {error_msg}"
+                )
+            
+            # Get band count
+            band_count = ds.RasterCount
+            logger.info(f"Input raster has {band_count} bands")
+            
+            # Check if band mapping is valid
+            invalid_bands = []
+            for band_name, band_number in band_mapping.items():
+                if band_number < 1 or band_number > band_count:
+                    invalid_bands.append((band_name, band_number))
+            
+            if invalid_bands:
+                error_msg = f"Invalid band mapping: {invalid_bands}. Raster has {band_count} bands."
+                logger.error(error_msg)
+                return ProcessingResult(
+                    status="error",
+                    message=error_msg
+                )
+            
+            # Close the dataset
+            ds = None
+        except ImportError:
+            logger.warning("GDAL not available for raster checking")
         except Exception as e:
             logger.error(f"Error checking input raster: {str(e)}", exc_info=True)
             return ProcessingResult(
