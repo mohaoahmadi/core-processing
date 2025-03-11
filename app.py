@@ -1116,77 +1116,29 @@ async def list_project_processed_rasters(project_id: str):
 
 @app.get(f"{settings.API_V1_PREFIX}/processed-rasters/{{processed_raster_id}}/metadata", response_model=Dict[str, Any])
 async def get_processed_raster_metadata(processed_raster_id: str):
-    """Get detailed metadata for a processed raster.
+    """Get metadata for a processed raster.
     
     Args:
         processed_raster_id: UUID of the processed raster
         
     Returns:
-        Dict[str, Any]: Detailed metadata including:
-            - Basic file information
-            - Processing job details
-            - Output-specific metadata
-            - GeoTIFF metadata if available
+        Dict containing processed raster metadata
     """
     try:
         supabase = get_supabase()
         
-        # Get processed raster information with job details
-        result = supabase.table("processed_rasters").select(
-            "*",
-            "processing_jobs(*)",
-            "raster_file:raster_files(*)"
-        ).eq("id", processed_raster_id).execute()
+        # Query the processed_rasters table with explicit relationship definitions
+        response = supabase.table('processed_rasters').select(
+            '*',
+            'processing_jobs!processed_rasters_processing_job_id_fkey(*)',  # Specify the exact foreign key relationship
+            'raster_files(*)'
+        ).eq('id', processed_raster_id).execute()
         
-        if not result.data:
+        if not response.data:
             raise HTTPException(status_code=404, detail="Processed raster not found")
+            
+        return response.data[0]
         
-        processed_raster = result.data[0]
-        
-        # Get GeoTIFF metadata if the file exists
-        geotiff_metadata = None
-        s3_url = processed_raster.get("s3_url")
-        
-        if s3_url:
-            try:
-                # Extract S3 key from URL
-                s3_key = s3_url[5:] if s3_url.startswith("s3://") else s3_url
-                
-                # Create analysis request
-                analysis_request = GeoTiffAnalysisRequest(
-                    file_path=s3_key
-                )
-                
-                # Get GeoTIFF metadata
-                geotiff_metadata = await analyze_geotiff_endpoint(analysis_request)
-            except Exception as e:
-                logger.warning(f"Could not analyze GeoTIFF: {str(e)}")
-                geotiff_metadata = {"error": str(e)}
-        
-        # Construct response with all metadata
-        response = {
-            "id": processed_raster["id"],
-            "file_info": {
-                "s3_url": processed_raster["s3_url"],
-                "output_type": processed_raster["output_type"],
-                "width": processed_raster["width"],
-                "height": processed_raster["height"],
-                "band_count": processed_raster["band_count"],
-                "driver": processed_raster["driver"],
-                "bounds": processed_raster["bounds"],
-                "created_at": processed_raster.get("created_at"),
-                "updated_at": processed_raster.get("updated_at")
-            },
-            "processing_job": processed_raster.get("processing_jobs"),
-            "input_raster": processed_raster.get("raster_file"),
-            "metadata": processed_raster.get("metadata", {}),
-            "geotiff_metadata": geotiff_metadata
-        }
-        
-        return response
-        
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error getting processed raster metadata: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
