@@ -72,7 +72,7 @@ from processors.orthomosaic import OrthomosaicProcessor
 from processors.health_indices import HealthIndicesProcessor
 from processors.terrain import TerrainAnalysisProcessor
 from utils.logging import setup_logging
-from utils.geo_utils import analyze_geotiff
+from utils.geo_utils import analyze_geotiff  # Import the async version
 from utils.supabase_raster_manager import get_project_raster_files
 
 settings = get_settings()
@@ -297,6 +297,82 @@ async def create_job(
         
         logger.debug(f"Input S3 key: {input_s3_key}")
         
+        # Download and analyze input file
+        import tempfile
+        import os
+        from lib.s3_manager import download_file_sync
+        
+        try:
+            # Create temporary file for analysis
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_input:
+                tmp_input_path = tmp_input.name
+                logger.info(f"Downloading input file to: {tmp_input_path}")
+                download_file_sync(input_s3_key, tmp_input_path)
+                
+                # Analyze the input file
+                logger.info("Analyzing input GeoTIFF")
+                analysis_result = await analyze_geotiff(tmp_input_path)  # Add await here
+                logger.debug(f"Analysis result: {analysis_result}")
+                
+                # Update input file record with analysis results if not already present
+                if not input_file.get("width"):
+                    update_data = {
+                        "width": analysis_result["width"],
+                        "height": analysis_result["height"],
+                        "band_count": analysis_result["band_count"],
+                        "driver": analysis_result["driver"],
+                        "projection": analysis_result["projection"],
+                        "geotransform": analysis_result["geotransform"],
+                        "bounds": analysis_result["bounds"],
+                        "metadata": analysis_result["metadata"],
+                        "compression": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("COMPRESSION"),
+                        "interleave": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("INTERLEAVE")
+                    }
+                    supabase.table("raster_files").update(update_data).eq("id", input_file["id"]).execute()
+                    
+                    # Store band information
+                    for band in analysis_result["bands"]:
+                        band_data = {
+                            "id": str(uuid.uuid4()),
+                            "raster_file_id": input_file["id"],
+                            "band_number": band["band_number"],
+                            "data_type": band["data_type"],
+                            "min_value": band["min"],
+                            "max_value": band["max"],
+                            "mean_value": band["mean"],
+                            "stddev_value": band["stddev"],
+                            "nodata_value": band["nodata_value"],
+                            "color_interpretation": band["color_interpretation"],
+                            "histogram_min": band["histogram"]["min"],
+                            "histogram_max": band["histogram"]["max"],
+                            "metadata": {}
+                        }
+                        supabase.table("raster_bands").insert(band_data).execute()
+                    
+                    # Store derived subdatasets if present
+                    derived = analysis_result["metadata"].get("DERIVED_SUBDATASETS", {})
+                    for key in derived:
+                        if key.endswith("_NAME"):
+                            name = derived[key]
+                            desc_key = key.replace("_NAME", "_DESC")
+                            description = derived.get(desc_key)
+                            
+                            subdataset_data = {
+                                "id": str(uuid.uuid4()),
+                                "raster_file_id": input_file["id"],
+                                "name": name,
+                                "description": description
+                            }
+                            supabase.table("derived_subdatasets").insert(subdataset_data).execute()
+                
+        except Exception as analysis_error:
+            logger.error(f"Error during file analysis: {str(analysis_error)}")
+            raise HTTPException(status_code=500, detail=f"Error analyzing input file: {str(analysis_error)}")
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_input_path):
+                os.unlink(tmp_input_path)
+        
         try:
             # Create initial processed_rasters record only for non-health-indices jobs
             if process_type_str != "health_indices":
@@ -307,17 +383,17 @@ async def create_job(
                     "raster_file_id": str(input_file["id"]),  # Convert UUID to string
                     "output_type": process_type_str,  # Use string version consistently
                     "s3_url": f"s3://mirzamspectrum/{output_s3_key}",
-                    "width": 0,  # Will be updated after processing
-                    "height": 0,
-                    "band_count": 0,
+                    "width": analysis_result["width"],
+                    "height": analysis_result["height"],
+                    "band_count": analysis_result["band_count"],
                     "driver": "GTiff",
-                    "bounds": {
-                        "minx": 0,
-                        "miny": 0,
-                        "maxx": 0,
-                        "maxy": 0
-                    },
-                    "metadata": {}
+                    "projection": analysis_result["projection"],
+                    "geotransform": analysis_result["geotransform"],
+                    "bounds": analysis_result["bounds"],
+                    "metadata": {
+                        "input_analysis": analysis_result,
+                        "process_parameters": job_request.parameters
+                    }
                 }
                 
                 # Insert the processed raster record
@@ -336,7 +412,10 @@ async def create_job(
                 "input_file": job_request.input_file,
                 "input_raster_id": str(input_file["id"]),  # Convert UUID to string
                 "process_type": process_type_str,  # Use string version consistently
-                "parameters": job_request.parameters,
+                "parameters": {
+                    **job_request.parameters,
+                    "input_analysis": analysis_result
+                },
                 "status": "pending",
                 "processed_raster_id": processed_raster_id,  # Will be None for health indices
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -374,6 +453,7 @@ async def create_job(
             "output_name": output_name if process_type_str != "health_indices" else None,
             "output_path": output_s3_key if process_type_str != "health_indices" else None,
             "job_id": job_id,
+            "input_analysis": analysis_result,  # Pass analysis results to processor
             **job_request.parameters
         }
         
@@ -1502,6 +1582,15 @@ async def delete_raster_file(raster_file_id: str):
 async def complete_job(job_id: str):
     """Mark a job as completed and record processed files."""
     try:
+        # Add GDAL initialization at the start of the function
+        try:
+            from osgeo import gdal
+            gdal.AllRegister()  # Register all drivers
+            gdal.UseExceptions()  # Enable exceptions
+        except Exception as gdal_error:
+            logger.error(f"Error initializing GDAL: {str(gdal_error)}")
+            raise HTTPException(status_code=500, detail="Failed to initialize GDAL")
+
         # Get job information from Supabase
         supabase = get_supabase()
         job_result = supabase.table("processing_jobs").select("*").eq("id", job_id).execute()
@@ -1536,12 +1625,10 @@ async def complete_job(job_id: str):
                     indices_results = result_data["indices"]
                 elif "results" in result_data:
                     indices_results = result_data["results"]
-                # Try to parse from raw_result if it exists
                 elif "metadata" in result_data and "raw_result" in result_data["metadata"]:
                     try:
                         import ast
                         raw_result = result_data["metadata"]["raw_result"]
-                        # Convert string representation to dict
                         if isinstance(raw_result, str):
                             metadata_str = raw_result.split("metadata=")[1]
                             metadata_dict = ast.literal_eval(metadata_str)
@@ -1562,80 +1649,287 @@ async def complete_job(job_id: str):
             # Process each index
             for index_name, index_data in indices_results.items():
                 try:
-                    # Extract or construct the output path
-                    output_path = None
-                    if isinstance(index_data, dict):
-                        output_path = index_data.get("output_path")
+                    # Check if we have pre-computed analysis
+                    analysis_result = index_data.get("analysis")
+                    file_size = index_data.get("file_size")
+                    output_path = index_data.get("output_path")
                     
-                    # If no output path found, construct it
-                    if not output_path:
-                        org_id = job_data.get("organization_id")
-                        project_id = job_data.get("project_id")
-                        output_path = f"{org_id}/{project_id}/processed/health_indices/{index_name}.tif"
-                    
-                    # Ensure the path starts with s3://mirzamspectrum/
-                    if not output_path.startswith("s3://"):
-                        output_path = f"s3://mirzamspectrum/{output_path}"
-                    
-                    # Create processed raster record
-                    processed_raster_id = str(uuid.uuid4())
-                    
-                    # Store the first processed raster ID
-                    if first_processed_raster_id is None:
-                        first_processed_raster_id = processed_raster_id
-                    
-                    processed_raster = {
-                        "id": processed_raster_id,
-                        "processing_job_id": job_id,
-                        "raster_file_id": input_raster_id,
-                        "output_type": index_name,  # Use specific index name
-                        "s3_url": output_path,
-                        "width": index_data.get("width", 0),
-                        "height": index_data.get("height", 0),
-                        "band_count": 1,  # Health indices are single-band
-                        "driver": "GTiff",
-                        "bounds": {
-                            "minx": index_data.get("bounds", {}).get("minx", 0),
-                            "miny": index_data.get("bounds", {}).get("miny", 0),
-                            "maxx": index_data.get("bounds", {}).get("maxx", 0),
-                            "maxy": index_data.get("bounds", {}).get("maxy", 0)
-                        },
-                        "metadata": {
-                            "index_name": index_name,
-                            "formula": index_data.get("formula"),
-                            "description": index_data.get("description"),
-                            "value_range": index_data.get("value_range"),
-                            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                            "status": "completed"
-                        }
-                    }
-                    
-                    # Insert the record
-                    insert_result = supabase.table("processed_rasters").insert(processed_raster).execute()
-                    if not insert_result.data:
-                        logger.error(f"Failed to create processed raster record for {index_name}")
-                    else:
-                        logger.info(f"Created processed raster record for {index_name}: {processed_raster_id}")
+                    # If we have pre-computed analysis, use it
+                    if analysis_result and file_size and output_path:
+                        logger.info(f"Using pre-computed analysis for {index_name}")
                         
+                        # Create processed raster record with pre-computed data
+                        processed_raster_id = str(uuid.uuid4())
+                        
+                        # Store the first processed raster ID
+                        if first_processed_raster_id is None:
+                            first_processed_raster_id = processed_raster_id
+                        
+                        processed_raster = {
+                            "id": processed_raster_id,
+                            "processing_job_id": job_id,
+                            "raster_file_id": input_raster_id,
+                            "output_type": index_name,
+                            "s3_url": output_path,
+                            "file_size": file_size,
+                            "width": analysis_result["width"],
+                            "height": analysis_result["height"],
+                            "band_count": analysis_result["band_count"],
+                            "driver": analysis_result["driver"],
+                            "projection": analysis_result["projection"],
+                            "geotransform": analysis_result["geotransform"],
+                            "bounds": analysis_result["bounds"],
+                            "compression": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("COMPRESSION"),
+                            "interleave": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("INTERLEAVE"),
+                            "metadata": {
+                                "index_name": index_name,
+                                "formula": index_data.get("formula"),
+                                "description": index_data.get("description"),
+                                "value_range": index_data.get("value_range"),
+                                "analysis": analysis_result,
+                                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "status": "completed"
+                            }
+                        }
+                        
+                        # Insert the processed raster record
+                        insert_result = supabase.table("processed_rasters").insert(processed_raster).execute()
+                        if not insert_result.data:
+                            logger.error(f"Failed to create processed raster record for {index_name}")
+                            continue
+                        
+                        # Store band information
+                        for band in analysis_result["bands"]:
+                            band_data = {
+                                "id": str(uuid.uuid4()),
+                                "processed_raster_id": processed_raster_id,
+                                "band_number": band["band_number"],
+                                "data_type": band["data_type"],
+                                "min_value": band["min"],
+                                "max_value": band["max"],
+                                "mean_value": band["mean"],
+                                "stddev_value": band["stddev"],
+                                "nodata_value": band["nodata_value"],
+                                "color_interpretation": band["color_interpretation"],
+                                "histogram_min": band["histogram"]["min"],
+                                "histogram_max": band["histogram"]["max"],
+                                "metadata": {}
+                            }
+                            supabase.table("raster_bands").insert(band_data).execute()
+                        
+                        # Store derived subdatasets if present
+                        derived = analysis_result["metadata"].get("DERIVED_SUBDATASETS", {})
+                        for key in derived:
+                            if key.endswith("_NAME"):
+                                name = derived[key]
+                                desc_key = key.replace("_NAME", "_DESC")
+                                description = derived.get(desc_key)
+                                
+                                subdataset_data = {
+                                    "id": str(uuid.uuid4()),
+                                    "processed_raster_id": processed_raster_id,
+                                    "name": name,
+                                    "description": description
+                                }
+                                supabase.table("derived_subdatasets").insert(subdataset_data).execute()
+                    else:
+                        # Extract or construct the output path if not provided
+                        if not output_path:
+                            org_id = job_data.get("organization_id")
+                            project_id = job_data.get("project_id")
+                            output_path = f"{org_id}/{project_id}/processed/health_indices/{index_name}.tif"
+                        
+                        # Ensure the path starts with s3://mirzamspectrum/
+                        if not output_path.startswith("s3://"):
+                            output_path = f"s3://mirzamspectrum/{output_path}"
+                        
+                        # Download and analyze the output file
+                        import tempfile
+                        import os
+                        from lib.s3_manager import download_file_sync
+                        
+                        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_output:
+                            tmp_output_path = tmp_output.name
+                            s3_key = output_path.replace("s3://mirzamspectrum/", "")
+                            
+                            try:
+                                logger.info(f"Downloading output file for analysis: {s3_key}")
+                                download_file_sync(s3_key, tmp_output_path)
+                                
+                                # Add file size check
+                                file_size = os.path.getsize(tmp_output_path)
+                                if file_size == 0:
+                                    raise Exception("Downloaded file is empty")
+                                
+                                # Verify file exists and is readable
+                                if not os.path.exists(tmp_output_path):
+                                    raise Exception(f"File does not exist after download: {tmp_output_path}")
+                                
+                                # Try to open with GDAL directly first
+                                ds = gdal.Open(tmp_output_path)
+                                if ds is None:
+                                    raise Exception(f"GDAL cannot open file: {gdal.GetLastErrorMsg()}")
+                                ds = None  # Close the dataset
+                                
+                                # Now proceed with analysis
+                                logger.info(f"Analyzing output file for {index_name}")
+                                analysis_result = await analyze_geotiff(tmp_output_path)
+                                
+                                # Create processed raster record with file size
+                                processed_raster_id = str(uuid.uuid4())
+                                
+                                # Store the first processed raster ID
+                                if first_processed_raster_id is None:
+                                    first_processed_raster_id = processed_raster_id
+                                
+                                processed_raster = {
+                                    "id": processed_raster_id,
+                                    "processing_job_id": job_id,
+                                    "raster_file_id": input_raster_id,
+                                    "output_type": index_name,
+                                    "s3_url": output_path,
+                                    "file_size": file_size,
+                                    "width": analysis_result["width"],
+                                    "height": analysis_result["height"],
+                                    "band_count": analysis_result["band_count"],
+                                    "driver": analysis_result["driver"],
+                                    "projection": analysis_result["projection"],
+                                    "geotransform": analysis_result["geotransform"],
+                                    "bounds": analysis_result["bounds"],
+                                    "compression": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("COMPRESSION"),
+                                    "interleave": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("INTERLEAVE"),
+                                    "metadata": {
+                                        "index_name": index_name,
+                                        "formula": index_data.get("formula"),
+                                        "description": index_data.get("description"),
+                                        "value_range": index_data.get("value_range"),
+                                        "analysis": analysis_result,
+                                        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                        "status": "completed"
+                                    }
+                                }
+                                
+                                # Insert the processed raster record
+                                insert_result = supabase.table("processed_rasters").insert(processed_raster).execute()
+                                if not insert_result.data:
+                                    logger.error(f"Failed to create processed raster record for {index_name}")
+                                    continue
+                                
+                                # Store band information
+                                for band in analysis_result["bands"]:
+                                    band_data = {
+                                        "id": str(uuid.uuid4()),
+                                        "processed_raster_id": processed_raster_id,
+                                        "band_number": band["band_number"],
+                                        "data_type": band["data_type"],
+                                        "min_value": band["min"],
+                                        "max_value": band["max"],
+                                        "mean_value": band["mean"],
+                                        "stddev_value": band["stddev"],
+                                        "nodata_value": band["nodata_value"],
+                                        "color_interpretation": band["color_interpretation"],
+                                        "histogram_min": band["histogram"]["min"],
+                                        "histogram_max": band["histogram"]["max"],
+                                        "metadata": {}
+                                    }
+                                    supabase.table("raster_bands").insert(band_data).execute()
+                                
+                                # Store derived subdatasets if present
+                                derived = analysis_result["metadata"].get("DERIVED_SUBDATASETS", {})
+                                for key in derived:
+                                    if key.endswith("_NAME"):
+                                        name = derived[key]
+                                        desc_key = key.replace("_NAME", "_DESC")
+                                        description = derived.get(desc_key)
+                                        
+                                        subdataset_data = {
+                                            "id": str(uuid.uuid4()),
+                                            "processed_raster_id": processed_raster_id,
+                                            "name": name,
+                                            "description": description
+                                        }
+                                        supabase.table("derived_subdatasets").insert(subdataset_data).execute()
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing output file for {index_name}: {str(e)}")
+                                continue
+                            finally:
+                                # Clean up temporary file
+                                if os.path.exists(tmp_output_path):
+                                    os.unlink(tmp_output_path)
                 except Exception as e:
                     logger.error(f"Error processing index {index_name}: {str(e)}")
                     continue
             
-            # Update the job with the first processed raster ID
+            # Update job status
+            update_data = {
+                "status": "completed",
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            
+            # Add first processed raster ID if available
             if first_processed_raster_id:
-                logger.info(f"Updating job with processed_raster_id: {first_processed_raster_id}")
-                update_data = {
-                    "status": "completed",
-                    "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "processed_raster_id": first_processed_raster_id
-                }
-            else:
-                update_data = {
-                    "status": "completed",
-                    "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-                }
+                update_data["processed_raster_id"] = first_processed_raster_id
         else:
-            # For non-health-indices jobs
+            # For non-health-indices jobs, analyze the single output file
+            processed_raster_id = job_data.get("processed_raster_id")
+            if processed_raster_id:
+                try:
+                    # Get the processed raster record
+                    processed_result = supabase.table("processed_rasters").select("*").eq("id", processed_raster_id).execute()
+                    if processed_result.data:
+                        processed_raster = processed_result.data[0]
+                        output_path = processed_raster["s3_url"]
+                        
+                        # Download and analyze the output file
+                        import tempfile
+                        import os
+                        from lib.s3_manager import download_file_sync
+                        
+                        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_output:
+                            tmp_output_path = tmp_output.name
+                            s3_key = output_path.replace("s3://mirzamspectrum/", "")
+                            
+                            try:
+                                logger.info(f"Downloading output file for analysis: {s3_key}")
+                                download_file_sync(s3_key, tmp_output_path)
+                                
+                                # Analyze the output file
+                                logger.info("Analyzing output file")
+                                analysis_result = await analyze_geotiff(tmp_output_path)  # Add await here
+                                logger.debug(f"Analysis result: {analysis_result}")
+                                
+                                # Update the processed raster record with analysis results
+                                update_data = {
+                                    "width": analysis_result["width"],
+                                    "height": analysis_result["height"],
+                                    "band_count": analysis_result["band_count"],
+                                    "driver": analysis_result["driver"],
+                                    "projection": analysis_result["projection"],
+                                    "geotransform": analysis_result["geotransform"],
+                                    "bounds": analysis_result["bounds"],
+                                    "file_size": os.path.getsize(tmp_output_path),  # Add file size
+                                    "compression": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("COMPRESSION"),
+                                    "interleave": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("INTERLEAVE"),
+                                    "metadata": {
+                                        **processed_raster.get("metadata", {}),
+                                        "analysis": analysis_result
+                                    }
+                                }
+                                
+                                supabase.table("processed_rasters").update(update_data).eq("id", processed_raster_id).execute()
+                                
+                            except Exception as e:
+                                logger.error(f"Error analyzing output file: {str(e)}")
+                            finally:
+                                # Clean up temporary file
+                                if os.path.exists(tmp_output_path):
+                                    os.unlink(tmp_output_path)
+                    
+                except Exception as e:
+                    logger.error(f"Error updating processed raster: {str(e)}")
+            
+            # Update job status
             update_data = {
                 "status": "completed",
                 "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()

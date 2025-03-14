@@ -16,7 +16,7 @@ import sys
 
 from processors.base import BaseProcessor, ProcessingResult
 from lib.s3_manager import upload_file, download_file
-from utils.geo_utils import normalize_array
+from utils.geo_utils import normalize_array, analyze_geotiff
 from config import get_settings
 from supabase import create_client
 from lib.supabase_client import get_supabase
@@ -682,15 +682,39 @@ class HealthIndicesProcessor(BaseProcessor):
                     s3_key = f"processed/health_indices/{index_name}.tif"
                     logger.info(f"Saving to default location: {s3_key}")
                 
-                s3_path = await upload_file(output_path, s3_key)
-                
-                # Store result information
-                results[index_name] = {
-                    "output_path": s3_path,
-                    "formula": expr,
-                    "description": index_info["help"],
-                    "value_range": index_info.get("range", None)
-                }
+                # Analyze the file before uploading
+                try:
+                    logger.info(f"Analyzing output file for {index_name} before upload")
+                    analysis_result = await analyze_geotiff(output_path)
+                    file_size = os.path.getsize(output_path)
+                    
+                    logger.debug(f"Analysis result for {index_name}: {analysis_result}")
+                    logger.info(f"File size for {index_name}: {file_size} bytes")
+                    
+                    # Upload to S3
+                    s3_path = await upload_file(output_path, s3_key)
+                    
+                    # Store result information with analysis
+                    results[index_name] = {
+                        "output_path": s3_path,
+                        "formula": expr,
+                        "description": index_info["help"],
+                        "value_range": index_info.get("range", None),
+                        "analysis": analysis_result,
+                        "file_size": file_size
+                    }
+                except Exception as analysis_error:
+                    logger.error(f"Error analyzing {index_name}: {str(analysis_error)}")
+                    # Still upload the file even if analysis fails
+                    s3_path = await upload_file(output_path, s3_key)
+                    
+                    # Store basic result information
+                    results[index_name] = {
+                        "output_path": s3_path,
+                        "formula": expr,
+                        "description": index_info["help"],
+                        "value_range": index_info.get("range", None)
+                    }
             
             if not results:
                 return ProcessingResult(
