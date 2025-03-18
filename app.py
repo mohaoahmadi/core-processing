@@ -291,6 +291,12 @@ async def create_job(
         if process_type_str == "health_indices":
             output_base_path = f"{str(job_request.org_id)}/{str(job_request.project_id)}/processed/health_indices"
             # We don't need output_name or output_s3_key for health indices as each index creates its own file
+        elif process_type_str == "orthomosaic":
+            # Handle different orthomosaic types similar to health indices
+            output_type = job_request.parameters.get("output_type", "rgb")
+            output_base_path = f"{str(job_request.org_id)}/{str(job_request.project_id)}/processed/orthomosaic"
+            output_name = f"{job_request.project_id}_orthomosaic_{output_type}_{job_id[:8]}.tif"
+            output_s3_key = f"{output_base_path}/{output_name}"
         else:
             output_name = f"{job_request.project_id}_{process_type_str}_{job_id[:8]}.tif"
             output_s3_key = f"{str(job_request.org_id)}/{str(job_request.project_id)}/processed/{process_type_str}/{output_name}"
@@ -1870,8 +1876,169 @@ async def complete_job(job_id: str):
             # Add first processed raster ID if available
             if first_processed_raster_id:
                 update_data["processed_raster_id"] = first_processed_raster_id
+        elif process_type == "orthomosaic":
+            # Handle orthomosaic output types similar to health indices
+            result_data = job_data["result"]
+            output_types = {}
+            
+            # Check for orthomosaic output type
+            output_type = job_data.get("parameters", {}).get("output_type", "rgb")
+            
+            # Handle a single output file with the requested type
+            if isinstance(result_data, dict):
+                if "output_path" in result_data:
+                    output_types[output_type] = {
+                        "output_path": result_data["output_path"],
+                        "description": "RGB true color" if output_type == "rgb" else "False color infrared"
+                    }
+                elif "metadata" in result_data and "output_path" in result_data["metadata"]:
+                    output_types[output_type] = {
+                        "output_path": result_data["metadata"]["output_path"],
+                        "description": "RGB true color" if output_type == "rgb" else "False color infrared"
+                    }
+                # Add this fallback
+                elif job_data.get("processed_raster_id"):
+                    processed_result = supabase.table("processed_rasters").select("*").eq("id", job_data["processed_raster_id"]).execute()
+                    if processed_result.data and processed_result.data[0].get("s3_url"):
+                        output_types[output_type] = {
+                            "output_path": processed_result.data[0]["s3_url"],
+                            "description": "RGB true color" if output_type == "rgb" else "False color infrared"
+                        }
+                else:
+                    # Log the issue but continue
+                    logger.warning(f"No output path found for orthomosaic type {output_type}")
+            
+            # Handle multiple output files if they were generated
+            if "outputs" in result_data:
+                output_files = result_data["outputs"]
+                for out_type, out_data in output_files.items():
+                    output_types[out_type] = {
+                        "output_path": out_data["output_path"] if "output_path" in out_data else out_data,
+                        "description": "RGB true color" if out_type == "rgb" else "False color infrared"
+                    }
+            
+            # Track the first processed raster ID to update the job
+            first_processed_raster_id = None
+            
+            # Process each output type
+            for out_type, out_data in output_types.items():
+                try:
+                    output_path = out_data.get("output_path")
+                    
+                    # Skip if we don't have an output path
+                    if not output_path:
+                        logger.warning(f"No output path for orthomosaic type {out_type}, skipping")
+                        continue
+                    
+                    description = out_data["description"]
+                    
+                    # Ensure the path starts with s3://mirzamspectrum/
+                    if not output_path.startswith("s3://"):
+                        output_path = f"s3://mirzamspectrum/{output_path}"
+                    
+                    # Download and analyze the output file
+                    import tempfile
+                    import os
+                    from lib.s3_manager import download_file_sync
+                    
+                    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_output:
+                        tmp_output_path = tmp_output.name
+                        s3_key = output_path.replace("s3://mirzamspectrum/", "")
+                        
+                        try:
+                            logger.info(f"Downloading orthomosaic output file for analysis: {s3_key}")
+                            download_file_sync(s3_key, tmp_output_path)
+                            
+                            # Add file size check
+                            file_size = os.path.getsize(tmp_output_path)
+                            if file_size == 0:
+                                raise Exception("Downloaded file is empty")
+                            
+                            # Analyze the output file
+                            logger.info(f"Analyzing orthomosaic output file for {out_type}")
+                            analysis_result = await analyze_geotiff(tmp_output_path)
+                            
+                            # Create processed raster record
+                            processed_raster_id = str(uuid.uuid4())
+                            
+                            # Store the first processed raster ID
+                            if first_processed_raster_id is None:
+                                first_processed_raster_id = processed_raster_id
+                            
+                            # Determine output type for database
+                            output_type_db = f"orthomosaic_{out_type}"
+                            
+                            processed_raster = {
+                                "id": processed_raster_id,
+                                "processing_job_id": job_id,
+                                "raster_file_id": input_raster_id,
+                                "output_type": output_type_db,
+                                "s3_url": output_path,
+                                "file_size": file_size,
+                                "width": analysis_result["width"],
+                                "height": analysis_result["height"],
+                                "band_count": analysis_result["band_count"],
+                                "driver": analysis_result["driver"],
+                                "projection": analysis_result["projection"],
+                                "geotransform": analysis_result["geotransform"],
+                                "bounds": analysis_result["bounds"],
+                                "compression": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("COMPRESSION"),
+                                "interleave": analysis_result["metadata"].get("IMAGE_STRUCTURE", {}).get("INTERLEAVE"),
+                                "metadata": {
+                                    "output_type": out_type,
+                                    "description": description,
+                                    "analysis": analysis_result,
+                                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                    "status": "completed"
+                                }
+                            }
+                            
+                            # Insert the processed raster record
+                            insert_result = supabase.table("processed_rasters").insert(processed_raster).execute()
+                            if not insert_result.data:
+                                logger.error(f"Failed to create processed raster record for {out_type}")
+                                continue
+                            
+                            # Store band information
+                            for band in analysis_result["bands"]:
+                                band_data = {
+                                    "id": str(uuid.uuid4()),
+                                    "processed_raster_id": processed_raster_id,
+                                    "band_number": band["band_number"],
+                                    "data_type": band["data_type"],
+                                    "min_value": band["min"],
+                                    "max_value": band["max"],
+                                    "mean_value": band["mean"],
+                                    "stddev_value": band["stddev"],
+                                    "nodata_value": band["nodata_value"],
+                                    "color_interpretation": band["color_interpretation"],
+                                    "histogram_min": band["histogram"]["min"],
+                                    "histogram_max": band["histogram"]["max"],
+                                    "metadata": {}
+                                }
+                                supabase.table("raster_bands").insert(band_data).execute()
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing orthomosaic output file for {out_type}: {str(e)}")
+                        finally:
+                            # Clean up temporary file
+                            if os.path.exists(tmp_output_path):
+                                os.unlink(tmp_output_path)
+                
+                except Exception as e:
+                    logger.error(f"Error processing orthomosaic type {out_type}: {str(e)}")
+            
+            # Update job status
+            update_data = {
+                "status": "completed",
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            
+            # Add first processed raster ID if available
+            if first_processed_raster_id:
+                update_data["processed_raster_id"] = first_processed_raster_id
         else:
-            # For non-health-indices jobs, analyze the single output file
+            # For other job types, analyze the single output file
             processed_raster_id = job_data.get("processed_raster_id")
             if processed_raster_id:
                 try:
@@ -1966,6 +2133,12 @@ async def list_process_types():
                     "type": "string",
                     "description": "Method used for blending overlapping images",
                     "options": ["average", "mosaic", "max", "min"]
+                },
+                "output_type": {
+                    "type": "string",
+                    "description": "Type of output orthomosaic",
+                    "options": ["rgb", "false_color"],
+                    "default": "rgb"
                 }
             }
         ),
