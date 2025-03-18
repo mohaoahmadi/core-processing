@@ -1344,15 +1344,27 @@ async def delete_processed_raster(processed_raster_id: str):
                 logger.info(f"Deleting processed raster record: {raster_id}")
                 delete_result = supabase.table("processed_rasters").delete().eq("id", raster_id).execute()
                 
-                if delete_result.data:
+                # Check if there's data in the response
+                if delete_result and hasattr(delete_result, 'data') and delete_result.data:
                     logger.info(f"Successfully deleted processed raster record: {raster_id}")
                     deletion_status["record_deletion"] = True
                 else:
-                    logger.error(f"Failed to delete processed raster record: {raster_id}")
+                    # Try to extract more detailed error information
+                    if hasattr(delete_result, 'error'):
+                        error_detail = delete_result.error
+                    else:
+                        error_detail = "Unknown error, no response data returned"
+                    
+                    logger.error(f"Failed to delete processed raster record: {raster_id}. Error: {error_detail}")
                     all_successful = False
                     deletion_status["record_deletion"] = False
             except Exception as delete_error:
-                logger.error(f"Error deleting processed raster record {raster_id}: {str(delete_error)}", exc_info=True)
+                # Improved error handling with more detailed logging
+                error_message = str(delete_error)
+                if hasattr(delete_error, 'message'):
+                    error_message = delete_error.message
+                    
+                logger.error(f"Error deleting processed raster record {raster_id}: {error_message}", exc_info=True)
                 all_successful = False
                 deletion_status["record_deletion"] = False
             
