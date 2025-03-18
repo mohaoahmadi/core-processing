@@ -377,7 +377,11 @@ async def create_job(
         finally:
             # Clean up temporary file
             if os.path.exists(tmp_input_path):
-                os.unlink(tmp_input_path)
+                try:
+                    os.unlink(tmp_input_path)
+                    logger.debug(f"Deleted temporary file: {tmp_input_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {tmp_input_path}: {str(e)}")
         
         try:
             # Create initial processed_rasters record only for non-health-indices jobs
@@ -1231,122 +1235,162 @@ async def get_processed_raster_metadata(processed_raster_id: str):
 
 @app.delete(f"{settings.API_V1_PREFIX}/processed-rasters/{{processed_raster_id}}")
 async def delete_processed_raster(processed_raster_id: str):
-    """Delete a processed raster and its associated resources.
+    """Delete processed raster(s) and associated resources.
     
     Args:
-        processed_raster_id: UUID of the processed raster
+        processed_raster_id: UUID of the processed raster or comma-separated list of UUIDs
         
     Returns:
-        Dict[str, str]: Success message
+        Dict[str, Any]: Success message with details for each processed raster
         
     Raises:
-        HTTPException: If the raster is not found or cannot be deleted
+        HTTPException: If any raster is not found or cannot be deleted
     """
-    try:
-        supabase = get_supabase()
-        
-        # Get processed raster information
-        result = supabase.table("processed_rasters").select("*").eq("id", processed_raster_id).execute()
-        
-        if not result.data:
-            logger.warning(f"Processed raster not found: {processed_raster_id}")
-            raise HTTPException(status_code=404, detail="Processed raster not found")
-        
-        processed_raster = result.data[0]
-        s3_url = processed_raster.get("s3_url")
-        processing_job_id = processed_raster.get("processing_job_id")
-        
-        deletion_status = {
-            "s3_deletion": False,
-            "job_update": False,
-            "record_deletion": False
-        }
-        
-        # Delete from S3 if URL exists
-        if s3_url:
-            from lib.s3_manager import delete_file
-            try:
-                logger.info(f"Attempting to delete S3 file: {s3_url}")
-                bucket_name = "mirzamspectrum"
-                
-                # Extract just the path part after the bucket name
-                # Handle both s3://mirzamspectrum/path and just path formats
-                if s3_url.startswith("s3://"):
-                    # Remove s3:// and bucket name from the path
-                    s3_key = "/".join(s3_url.split("/")[3:])
-                else:
-                    # If no s3:// prefix, just remove bucket name if present
-                    s3_key = s3_url.replace(f"{bucket_name}/", "")
-                
-                logger.debug(f"Extracted S3 key for deletion: {s3_key}")
-                
-                deletion_success = await delete_file(s3_key, bucket_name)
-                if deletion_success:
-                    logger.info(f"Successfully deleted S3 file: {s3_key}")
-                    deletion_status["s3_deletion"] = True
-                else:
-                    logger.warning(f"Failed to delete S3 file: {s3_key}, but continuing with database updates")
-            except Exception as s3_error:
-                logger.error(f"Error in S3 deletion attempt: {str(s3_error)}", exc_info=True)
-        else:
-            logger.info("No S3 URL found for processed raster")
-            deletion_status["s3_deletion"] = True  # Mark as true since there's nothing to delete
-        
-        # Update the processing job to remove the reference
-        if processing_job_id:
-            try:
-                logger.info(f"Updating processing job {processing_job_id} to remove processed raster reference")
-                job_update = supabase.table("processing_jobs").update({
-                    "processed_raster_id": None,
-                    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-                }).eq("id", processing_job_id).execute()
-                
-                if job_update.data:
-                    logger.info(f"Successfully updated processing job {processing_job_id}")
-                    deletion_status["job_update"] = True
-                else:
-                    logger.warning(f"Failed to update processing job {processing_job_id}")
-            except Exception as job_error:
-                logger.error(f"Error updating processing job: {str(job_error)}", exc_info=True)
-        else:
-            logger.info("No processing job ID found to update")
-            deletion_status["job_update"] = True  # Mark as true since there's nothing to update
-        
-        # Delete the processed raster record
+    # Split the processed_raster_id parameter to handle multiple IDs
+    raster_ids = [id.strip() for id in processed_raster_id.split(',')]
+    
+    if not raster_ids:
+        logger.warning("No processed raster IDs provided")
+        raise HTTPException(status_code=400, detail="No processed raster IDs provided")
+    
+    logger.info(f"Deleting {len(raster_ids)} processed raster(s)")
+    
+    results = {}
+    all_successful = True
+    
+    for raster_id in raster_ids:
         try:
-            logger.info(f"Deleting processed raster record: {processed_raster_id}")
-            delete_result = supabase.table("processed_rasters").delete().eq("id", processed_raster_id).execute()
+            supabase = get_supabase()
             
-            if delete_result.data:
-                logger.info(f"Successfully deleted processed raster record: {processed_raster_id}")
-                deletion_status["record_deletion"] = True
+            # Get processed raster information
+            result = supabase.table("processed_rasters").select("*").eq("id", raster_id).execute()
+            
+            if not result.data:
+                logger.warning(f"Processed raster not found: {raster_id}")
+                results[raster_id] = {
+                    "status": "failed",
+                    "message": "Processed raster not found",
+                    "details": {
+                        "s3_deletion": False,
+                        "job_update": False,
+                        "record_deletion": False
+                    }
+                }
+                all_successful = False
+                continue
+            
+            processed_raster = result.data[0]
+            s3_url = processed_raster.get("s3_url")
+            processing_job_id = processed_raster.get("processing_job_id")
+            
+            deletion_status = {
+                "s3_deletion": False,
+                "job_update": False,
+                "record_deletion": False
+            }
+            
+            # Delete from S3 if URL exists
+            if s3_url:
+                from lib.s3_manager import delete_file
+                try:
+                    logger.info(f"Attempting to delete S3 file for raster {raster_id}: {s3_url}")
+                    bucket_name = "mirzamspectrum"
+                    
+                    # Extract just the path part after the bucket name
+                    # Handle both s3://mirzamspectrum/path and just path formats
+                    if s3_url.startswith("s3://"):
+                        # Remove s3:// and bucket name from the path
+                        s3_key = "/".join(s3_url.split("/")[3:])
+                    else:
+                        # If no s3:// prefix, just remove bucket name if present
+                        s3_key = s3_url.replace(f"{bucket_name}/", "")
+                    
+                    logger.debug(f"Extracted S3 key for deletion: {s3_key}")
+                    
+                    deletion_success = await delete_file(s3_key, bucket_name)
+                    if deletion_success:
+                        logger.info(f"Successfully deleted S3 file for raster {raster_id}")
+                        deletion_status["s3_deletion"] = True
+                    else:
+                        logger.warning(f"Failed to delete S3 file for raster {raster_id}, but continuing with database updates")
+                except Exception as s3_error:
+                    logger.error(f"Error in S3 deletion attempt for raster {raster_id}: {str(s3_error)}", exc_info=True)
             else:
-                logger.error(f"Failed to delete processed raster record: {processed_raster_id}")
-                raise Exception("Failed to delete processed raster record")
-        except Exception as delete_error:
-            logger.error(f"Error deleting processed raster record: {str(delete_error)}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Failed to delete processed raster record")
-        
-        # Prepare detailed response
-        success = all(deletion_status.values())
-        message = "Processed raster deletion completed with "
-        if success:
-            message += "all operations successful"
-        else:
-            failed_ops = [k for k, v in deletion_status.items() if not v]
-            message += f"some operations failed: {', '.join(failed_ops)}"
-        
-        return {
-            "status": "success" if success else "partial_success",
-            "message": message,
-            "details": deletion_status
-        }
+                logger.info(f"No S3 URL found for processed raster {raster_id}")
+                deletion_status["s3_deletion"] = True  # Mark as true since there's nothing to delete
             
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting processed raster: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+            # Update the processing job to remove the reference
+            if processing_job_id:
+                try:
+                    logger.info(f"Updating processing job {processing_job_id} to remove reference to raster {raster_id}")
+                    job_update = supabase.table("processing_jobs").update({
+                        "processed_raster_id": None,
+                        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    }).eq("id", processing_job_id).execute()
+                    
+                    if job_update.data:
+                        logger.info(f"Successfully updated processing job {processing_job_id}")
+                        deletion_status["job_update"] = True
+                    else:
+                        logger.warning(f"Failed to update processing job {processing_job_id}")
+                except Exception as job_error:
+                    logger.error(f"Error updating processing job for raster {raster_id}: {str(job_error)}", exc_info=True)
+            else:
+                logger.info(f"No processing job ID found to update for raster {raster_id}")
+                deletion_status["job_update"] = True  # Mark as true since there's nothing to update
+            
+            # Delete the processed raster record
+            try:
+                logger.info(f"Deleting processed raster record: {raster_id}")
+                delete_result = supabase.table("processed_rasters").delete().eq("id", raster_id).execute()
+                
+                if delete_result.data:
+                    logger.info(f"Successfully deleted processed raster record: {raster_id}")
+                    deletion_status["record_deletion"] = True
+                else:
+                    logger.error(f"Failed to delete processed raster record: {raster_id}")
+                    all_successful = False
+                    deletion_status["record_deletion"] = False
+            except Exception as delete_error:
+                logger.error(f"Error deleting processed raster record {raster_id}: {str(delete_error)}", exc_info=True)
+                all_successful = False
+                deletion_status["record_deletion"] = False
+            
+            # Store result for this processed raster
+            success = all(deletion_status.values())
+            message = "Processed raster deletion completed with "
+            if success:
+                message += "all operations successful"
+            else:
+                failed_ops = [k for k, v in deletion_status.items() if not v]
+                message += f"some operations failed: {', '.join(failed_ops)}"
+                all_successful = False
+            
+            results[raster_id] = {
+                "status": "success" if success else "partial_success",
+                "message": message,
+                "details": deletion_status
+            }
+                
+        except Exception as e:
+            logger.error(f"Error deleting processed raster {raster_id}: {str(e)}", exc_info=True)
+            results[raster_id] = {
+                "status": "failed",
+                "message": str(e),
+                "details": {
+                    "s3_deletion": False,
+                    "job_update": False,
+                    "record_deletion": False
+                }
+            }
+            all_successful = False
+    
+    # Prepare overall response
+    return {
+        "status": "success" if all_successful else "partial_success",
+        "message": f"Deleted {len(raster_ids)} processed raster(s) with {len([r for r in results.values() if r['status'] == 'success'])} successful",
+        "results": results
+    }
 
 @app.get(f"{settings.API_V1_PREFIX}/band-mappings", response_model=List[Dict[str, Any]])
 async def list_band_mappings(project_id: str = None):
@@ -1499,90 +1543,128 @@ async def delete_raster_file(raster_file_id: str):
     """Delete a raster file.
     
     Args:
-        raster_file_id: UUID of the raster file
+        raster_file_id: UUID of the raster file or comma-separated list of UUIDs
         
     Returns:
-        Dict[str, str]: Success message
+        Dict[str, Any]: Success message with details for each raster file
         
     Raises:
-        HTTPException: If the file is not found or cannot be deleted
+        HTTPException: If any file is not found or cannot be deleted
     """
-    try:
-        supabase = get_supabase()
-        
-        # Get file information
-        result = supabase.table("raster_files").select("*").eq("id", raster_file_id).execute()
-        
-        if not result.data:
-            logger.warning(f"Raster file not found: {raster_file_id}")
-            raise HTTPException(status_code=404, detail="Raster file not found")
-        
-        file_data = result.data[0]
-        s3_url = file_data.get("s3_url")
-        
-        deletion_status = {
-            "s3_deletion": False,
-            "record_update": False
-        }
-        
-        # Delete from S3 if URL exists
-        if s3_url:
-            from lib.s3_manager import delete_file
-            try:
-                logger.info(f"Attempting to delete S3 file: {s3_url}")
-                bucket_name = "mirzamspectrum"
-                s3_key = s3_url[5:] if s3_url.startswith("s3://") else s3_url
-                
-                deletion_success = await delete_file(s3_key, bucket_name)
-                if deletion_success:
-                    logger.info(f"Successfully deleted S3 file: {s3_key}")
-                    deletion_status["s3_deletion"] = True
-                else:
-                    logger.warning(f"Failed to delete S3 file: {s3_key}, but continuing with database update")
-            except Exception as s3_error:
-                logger.error(f"Error in S3 deletion attempt: {str(s3_error)}", exc_info=True)
-        else:
-            logger.info("No S3 URL found for raster file")
-            deletion_status["s3_deletion"] = True  # Mark as true since there's nothing to delete
-        
-        # Update database record
+    # Split the raster_file_id parameter to handle multiple IDs
+    raster_ids = [id.strip() for id in raster_file_id.split(',')]
+    
+    if not raster_ids:
+        logger.warning("No raster file IDs provided")
+        raise HTTPException(status_code=400, detail="No raster file IDs provided")
+    
+    logger.info(f"Deleting {len(raster_ids)} raster file(s)")
+    
+    results = {}
+    all_successful = True
+    
+    for file_id in raster_ids:
         try:
-            logger.info(f"Marking raster file as deleted: {raster_file_id}")
-            update_result = supabase.table("raster_files").update({
-                "deleted": True,
-                "deleted_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }).eq("id", raster_file_id).execute()
+            supabase = get_supabase()
             
-            if update_result.data:
-                logger.info(f"Successfully marked raster file as deleted: {raster_file_id}")
-                deletion_status["record_update"] = True
+            # Get file information
+            result = supabase.table("raster_files").select("*").eq("id", file_id).execute()
+            
+            if not result.data:
+                logger.warning(f"Raster file not found: {file_id}")
+                results[file_id] = {
+                    "status": "failed",
+                    "message": "Raster file not found",
+                    "details": {
+                        "s3_deletion": False,
+                        "record_update": False
+                    }
+                }
+                all_successful = False
+                continue
+            
+            file_data = result.data[0]
+            s3_url = file_data.get("s3_url")
+            
+            deletion_status = {
+                "s3_deletion": False,
+                "record_update": False
+            }
+            
+            # Delete from S3 if URL exists
+            if s3_url:
+                from lib.s3_manager import delete_file
+                try:
+                    logger.info(f"Attempting to delete S3 file: {s3_url}")
+                    bucket_name = "mirzamspectrum"
+                    s3_key = s3_url[5:] if s3_url.startswith("s3://") else s3_url
+                    
+                    deletion_success = await delete_file(s3_key, bucket_name)
+                    if deletion_success:
+                        logger.info(f"Successfully deleted S3 file: {s3_key}")
+                        deletion_status["s3_deletion"] = True
+                    else:
+                        logger.warning(f"Failed to delete S3 file: {s3_key}, but continuing with database update")
+                except Exception as s3_error:
+                    logger.error(f"Error in S3 deletion attempt for {file_id}: {str(s3_error)}", exc_info=True)
             else:
-                logger.error(f"Failed to update raster file record: {raster_file_id}")
-                raise Exception("Failed to update raster file record")
-        except Exception as update_error:
-            logger.error(f"Error updating raster file record: {str(update_error)}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Failed to update raster file record")
-        
-        # Prepare detailed response
-        success = all(deletion_status.values())
-        message = "Raster file deletion completed with "
-        if success:
-            message += "all operations successful"
-        else:
-            failed_ops = [k for k, v in deletion_status.items() if not v]
-            message += f"some operations failed: {', '.join(failed_ops)}"
-        
-        return {
-            "status": "success" if success else "partial_success",
-            "message": message,
-            "details": deletion_status
-        }
+                logger.info(f"No S3 URL found for raster file {file_id}")
+                deletion_status["s3_deletion"] = True  # Mark as true since there's nothing to delete
             
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting raster file: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+            # Update database record
+            try:
+                logger.info(f"Marking raster file as deleted: {file_id}")
+                update_result = supabase.table("raster_files").update({
+                    "deleted": True,
+                    "deleted_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                }).eq("id", file_id).execute()
+                
+                if update_result.data:
+                    logger.info(f"Successfully marked raster file as deleted: {file_id}")
+                    deletion_status["record_update"] = True
+                else:
+                    logger.error(f"Failed to update raster file record: {file_id}")
+                    all_successful = False
+                    deletion_status["record_update"] = False
+            except Exception as update_error:
+                logger.error(f"Error updating raster file record {file_id}: {str(update_error)}", exc_info=True)
+                all_successful = False
+                deletion_status["record_update"] = False
+            
+            # Store result for this file
+            success = all(deletion_status.values())
+            message = "Raster file deletion completed with "
+            if success:
+                message += "all operations successful"
+            else:
+                failed_ops = [k for k, v in deletion_status.items() if not v]
+                message += f"some operations failed: {', '.join(failed_ops)}"
+                all_successful = False
+            
+            results[file_id] = {
+                "status": "success" if success else "partial_success",
+                "message": message,
+                "details": deletion_status
+            }
+                
+        except Exception as e:
+            logger.error(f"Error deleting raster file {file_id}: {str(e)}", exc_info=True)
+            results[file_id] = {
+                "status": "failed",
+                "message": str(e),
+                "details": {
+                    "s3_deletion": False,
+                    "record_update": False
+                }
+            }
+            all_successful = False
+    
+    # Prepare overall response
+    return {
+        "status": "success" if all_successful else "partial_success",
+        "message": f"Deleted {len(raster_ids)} raster file(s) with {len([r for r in results.values() if r['status'] == 'success'])} successful",
+        "results": results
+    }
 
 @app.post(f"{settings.API_V1_PREFIX}/jobs/{{job_id}}/complete", response_model=Dict[str, Any])
 async def complete_job(job_id: str):

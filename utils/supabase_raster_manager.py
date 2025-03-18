@@ -342,4 +342,27 @@ async def get_project_processed_rasters(project_id: str) -> List[Dict[str, Any]]
         
     except Exception as e:
         logger.error(f"Failed to get project processed rasters: {str(e)}")
-        return [] 
+        return []
+
+async def mark_raster_as_deleted(raster_id: str) -> bool:
+    """Mark a raster file as deleted in the database.
+    
+    Args:
+        raster_id: UUID of the raster file to mark as deleted
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        supabase = get_supabase()
+        
+        # Update the raster file in the database
+        result = (supabase.table("raster_files")
+                 .update({"deleted": True})
+                 .eq("id", raster_id)
+                 .execute())
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error marking raster as deleted: {str(e)}")
+        return False 
