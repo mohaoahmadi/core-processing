@@ -20,6 +20,7 @@ from lib.s3_manager import upload_file, download_file
 from utils.geo_utils import align_rasters, blend_overlapping_areas, analyze_geotiff
 from utils.supabase_raster_manager import register_processed_raster
 from config import get_settings
+from supabase import create_client
 
 settings = get_settings()
 
@@ -298,38 +299,24 @@ class OrthomosaicProcessor(BaseProcessor):
                     self.logger.info(f"Uploaded composite to S3: {s3_path}")
                     
                     # Register the processed raster in the database
-                    if analysis_result:
-                        try:
-                            # Extract overall min/max/mean from the bands
-                            min_value = min([band['min'] for band in analysis_result['bands']])
-                            max_value = max([band['max'] for band in analysis_result['bands']])
-                            mean_value = sum([band['mean'] for band in analysis_result['bands']]) / len(analysis_result['bands'])
+                    try:
+                        # Check if a processed raster already exists for this job
+                        supabase = create_client()
+                        existing = await supabase.table('processed_rasters')\
+                            .select('id')\
+                            .eq('processing_job_id', job_id)\
+                            .eq('output_type', output_type)\
+                            .single()\
+                            .execute()
+                        
+                        if existing.data:
+                            processed_raster_id = existing.data['id']
+                            self.logger.info(f"Using existing processed raster record: {processed_raster_id}")
+                        else:
+                            # Get the source raster file ID from kwargs
+                            source_raster_file_id = kwargs.get("input_raster_id")
                             
-                            # Prepare metadata for registration
-                            metadata = {
-                                'width': analysis_result['width'],
-                                'height': analysis_result['height'],
-                                'band_count': analysis_result['band_count'],
-                                'driver': analysis_result['driver'],
-                                'projection': analysis_result['projection'],
-                                'geotransform': analysis_result['geotransform'],
-                                'bounds': analysis_result['bounds'],
-                                'min_value': min_value,
-                                'max_value': max_value,
-                                'mean_value': mean_value,
-                                'metadata': {
-                                    'output_type': output_type,
-                                    'band_mapping': band_mapping,
-                                    'stats': stats
-                                }
-                            }
-                            
-                            # Get the source raster file ID
-                            # In a real implementation, this would be retrieved from the database
-                            # using the input_path. For now, we'll use None as we don't have this info.
-                            source_raster_file_id = None
-                            
-                            # Register in database
+                            # Register in database only if no existing record
                             processed_raster_id = await register_processed_raster(
                                 job_id,
                                 source_raster_file_id,
@@ -337,10 +324,9 @@ class OrthomosaicProcessor(BaseProcessor):
                                 s3_path,
                                 metadata
                             )
-                            
-                            self.logger.info(f"Registered processed raster with ID: {processed_raster_id}")
-                        except Exception as reg_error:
-                            self.logger.error(f"Failed to register processed raster: {str(reg_error)}")
+                            self.logger.info(f"Created new processed raster record: {processed_raster_id}")
+                    except Exception as reg_error:
+                        self.logger.error(f"Failed to register processed raster: {str(reg_error)}")
                 except Exception as e:
                     self.logger.error(f"Failed to upload to S3: {str(e)}")
                     return ProcessingResult(
